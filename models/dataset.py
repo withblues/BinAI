@@ -66,3 +66,16 @@ class BERTDataset(Dataset):
     def get_sent(self, index):
         t1, t2 = self.lines[index]
         return t1, t2
+
+class PrecomputeDataset(Dataset):
+    def __init__(self, indexed_data):
+        self.data = indexed_data
+        self.keys = list(indexed_data.keys())
+    
+    def __len__(self):
+        return len(self.keys)
+    
+    def __getitem__(self, idx):
+        key = self.keys[idx]
+        instructions = self.data[key]
+        return key, instructions
