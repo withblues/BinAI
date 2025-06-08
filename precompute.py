@@ -40,8 +40,8 @@ if __name__ == '__main__':
     if args.indexing:
         data = {i: element for i, element in enumerate(data)}
 
-        parts = data_dir.split('.')
-        with open(f'{parts[0]}-indexed.{parts[1]}', 'wb') as f:
+        base, ext = os.path.splitext(data_dir)
+        with open(f'{base}-indexed.{ext}', 'wb') as f:
             pickle.dump(data, f)
     
     if not isinstance(data, dict):
@@ -69,8 +69,8 @@ if __name__ == '__main__':
     output_data = {}
 
     # add checkpointing
-    parts = output_dir.split('.')
-    checkpoint_path = f'{parts[0]}-checkpoint.{parts[1]}'
+    base, ext = os.path.splitext(output_dir)
+    checkpoint_path = f'{base}-checkpoint.{ext}'
     if os.path.exists(checkpoint_path):
         print(f'Loading checkpoint from {checkpoint_path}')
         with open(checkpoint_path, 'rb') as f:
@@ -79,8 +79,6 @@ if __name__ == '__main__':
     with torch.no_grad():
         for batch_idx, data in enumerate(tqdm(dataloader, desc='creating embeddings ...')):
             keys, instructions = data
-
-            print(type(keys[0]))
 
             # skip batch if already in checkpoint
             if all(key in output_data for key in keys):
@@ -97,7 +95,7 @@ if __name__ == '__main__':
                 output_data[key] = asm_embeddings_np[i]
 
             # checkpoint
-            if batch_idx % 2000 == 0:
+            if (batch_idx + 1) % 1000 == 0:
                 with open(checkpoint_path, 'wb') as f:
                     pickle.dump(output_data, f)
                 print(f'Checkpoint saved at batch {batch_idx}')
