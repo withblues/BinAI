@@ -31,6 +31,7 @@ if __name__ == '__main__':
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     data_dir = args.data_dir
+    output_dir = args.output_dir
 
     # load data
     data = load_data(data_dir)
@@ -66,9 +67,24 @@ if __name__ == '__main__':
     teacher_model = PreTrainedModel('hustcw/clap-asm', device)
 
     output_data = {}
+
+    # add checkpointing
+    parts = output_dir.split('.')
+    checkpoint_path = f'{parts[0]}-checkpoint.{parts[1]}'
+    if os.path.exists(checkpoint_path):
+        print(f'Loading checkpoint from {checkpoint_path}')
+        with open(checkpoint_path, 'rb') as f:
+            output_data = pickle.load(f)
+
     with torch.no_grad():
-        for data in tqdm(dataloader, desc='creating embeddings ...'):
+        for batch_idx, data in enumerate(tqdm(dataloader, desc='creating embeddings ...')):
             keys, instructions = data
+
+            print(type(keys[0]))
+
+            # skip batch if already in checkpoint
+            if all(key in output_data for key in keys):
+                continue
 
             asm_input = teacher_model.asm_tokenizer(instructions, padding=True, return_tensors='pt').to(device)
             asm_embeddings = teacher_model.asm_encoder(**asm_input)
@@ -78,11 +94,23 @@ if __name__ == '__main__':
 
             # map key with embeddings
             for i, key in enumerate(keys):
-                output_data[key.item() if isinstance(key, torch.Tensor) else key] = asm_embeddings_np[i]
+                output_data[key] = asm_embeddings_np[i]
+
+            # checkpoint
+            if batch_idx % 2000 == 0:
+                with open(checkpoint_path, 'wb') as f:
+                    pickle.dump(output_data, f)
+                print(f'Checkpoint saved at batch {batch_idx}')
     
 
     # save embeddings
-    with open(args.output_dir, 'wb') as f:
+    print(f'saving embeddings at {output_dir}')
+    with open(output_dir, 'wb') as f:
         pickle.dump(output_data, f)
+
+    # remove uneccessary checkpoint
+    print(f'deleting old checkpoint {checkpoint_path}')
+    if os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
 
     print('precomputing done')
