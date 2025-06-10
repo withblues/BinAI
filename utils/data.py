@@ -7,5 +7,6 @@ def load_data(dir_path: str):
     with open(binary, 'rb') as c:
         data = pickle.load(c)
 
+    print(f'loaded {dir_path} to disk')
     return data
 
