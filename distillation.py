@@ -21,6 +21,7 @@ class DistillTrainer:
             train_dataloader,
             max_len,
             total_seq_len,
+            gradient_accumulation_steps,
             valid_dataloader=None,
             lr= 1e-5,
             weight_decay=0.01,
@@ -37,9 +38,10 @@ class DistillTrainer:
         self.train_dataloader = train_dataloader
         self.valid_dataloader = valid_dataloader
 
-        # sizes for reshaping
+        # hyperparameters
         self.max_len = max_len
         self.total_seq_len = total_seq_len
+        self.gradient_accumulation_steps = gradient_accumulation_steps
         
         self.optim = Adam(
             list(self.model.parameters()) + list(self.projector.parameters()),
@@ -91,6 +93,7 @@ class DistillTrainer:
         if train:
             self.model.train()
             self.projector.train()
+            self.optim.zero_grad()
         
         else:
             self.model.eval()
@@ -120,7 +123,7 @@ class DistillTrainer:
                     128
                 )
 
-                # 4. Masked Summation
+                # 4. Masked Summation so we discard padded instructions
                 attention_mask_expanded = parts_attention_mask_batch.unsqueeze(-1)
                 masked_encoded_parts = encoded_parts_batched_view * attention_mask_expanded
                 student_summed_function_embeddings = torch.sum(masked_encoded_parts, dim=1)
@@ -130,19 +133,22 @@ class DistillTrainer:
                 loss = self.criterion(student_summed_function_embeddings, projected_teacher_embeddings)
 
             if train:
-                # 3. backward and optimization only in train
-                self.optim.zero_grad()
-                loss.backward()
-                self.optim.step()
-                self.optim_schedule.step()
+                loss = loss / self.gradient_accumulation_steps
+                loss.backwards()
 
-            avg_loss += loss.item()
+                # 3. backward and optimization only in train and if accumulation steps
+                if (i + 1) % self.gradient_accumulation_steps == 0 or (i + 1) == len(data_loader):
+                    self.optim.step()
+                    self.optim_schedule.step()
+                    self.optim.zero_grad()
+
+            avg_loss += loss.item() * gradient_accumulation_steps
 
             post_fix = {
                 "epoch": epoch,
                 "iter": i,
                 "avg_loss": avg_loss / (i + 1),
-                "loss": loss.item()
+                "loss": loss.item() * gradient_accumulation_steps
             }
 
             if i % self.log_freq == 0:
@@ -154,79 +160,6 @@ class DistillTrainer:
         return avg_loss
     
 
-def simulate_BERTDataset_without_masking(data_pairs, tokenizer, seq_len):
-    # does the same as BERTDataset but removes masking and stacks all combines
-    # everything so that we have on instruction for each function
-    student_inputs = []
-
-    for t1_char_str, t2_char_str in data_pairs:
-
-        # tokenizer assembly code
-        t1_tokens = tokenizer.encode(t1_char_str)
-        t2_tokens = tokenizer.encode(t2_char_str)
-
-        # skip masking
-        t1_padded = t1_tokens[:seq_len] + [tokenizer.vocab['[PAD]']] * (seq_len - len(t1_tokens))
-        t2_padded = t2_tokens[:seq_len] + [tokenizer.vocab['[PAD]']] * (seq_len - len(t2_tokens))
-
-        # adding CLS and SEP tokens
-        bert_input = [tokenizer.vocab['[CLS]']] + t1_padded + [tokenizer.vocab['[SEP]']] + t2_padded + [tokenizer.vocab['[SEP]']]
-        
-        student_inputs.append(
-            torch.tensor(bert_input, dtype=torch.long)
-        )
-
-    return student_inputs
-    
-
-def load_assembly_data(data):
-    data_pairs = []
-    for item in data:
-        for i in range(0, len(item)-1, 2):
-            data_pairs.append((item[i].strip(), item[i+1].strip()))
-
-    return data_pairs
-
-def prepare_dataset_for_bert(data, tokenizer, max_len, seq_len, total_seq_length):
-    processed_data = []
-
-    for idx, (instructions, teacher_embeddings) in data.items():
-        data_pairs = load_assembly_data(instructions)
-
-        # tokenizer each pair
-        data_pairs_tokenize = simulate_BERTDataset_without_masking(data_pairs, tokenizer, seq_len)
-
-        # get length of our function
-        len_function = len(data_pairs_tokenize)
-
-        # truncate if function is longer than max_len
-        final_function = []
-        final_attention_mask = []
-        if len_function >= max_len:
-            final_function = data_pairs_tokenize[:max_len]
-            final_attention_mask = [1] * max_len
-        
-        else: # else we pad so every function has the same length
-            final_function = data_pairs_tokenize
-            final_attention_mask = [1] * len_function
-
-            # create dummy instructions
-            num_padding_needed = max_len - len_function
-            padded_tensor = torch.full((total_seq_length,), tokenizer.vocab['[PAD]'], dtype=torch.long)
-
-            # add dummy instructions
-            final_function.extend([padded_tensor] * num_padding_needed)
-            final_attention_mask.extend([0] * num_padding_needed)
-
-        # add to output
-        processed_data.append({
-            'function_id': idx,
-            'student_instruction': final_function,
-            'student_attention_mask': torch.tensor(final_attention_mask, dtype=torch.long),
-            'teacher_embedding': torch.from_numpy(teacher_embeddings).float()
-        })
-
-    return processed_data
 
 if __name__=="__main__":
     parser = argparse.ArgumentParser(description="Command line parameters")
@@ -234,7 +167,8 @@ if __name__=="__main__":
     parser.add_argument('--output_dir', required=True)
     parser.add_argument('--max_len', default=256)
     parser.add_argument('--seq_len', default=16)
-    parser.add_argument('--batch_size', default=2)
+    parser.add_argument('--batch_size', default=8)
+    parser.add_argument('--gradient_accumulation_steps', default=8)
     args = parser.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -247,40 +181,16 @@ if __name__=="__main__":
     # seq_len * 2 (data pairs) + [CLS] + [SEQ] + [SEQ]
     total_seq_len = seq_len * 2 + 3
     batch_size = args.batch_size
+    gradient_accumulation_steps = args.gradient_accumulation_steps
 
-    # load input data for student model
-    train_data = load_data(os.path.join(data_dir, 'baseline-train-indexed.pkl'))
-    # valid_data = load_data(os.path.join(data_dir, 'baseline-valid-indexed.pkl'))
-    # if not isinstance(train_data, dict) or not isinstance(valid_data, dict):
-    #     raise TypeError('Expected both train_data and valid_data to be dicts')
-    
-    # load precomputed data from teacher model
-    train_embedding_data = load_data(os.path.join(data_dir, 'clap-train-embeddings.pkl'))
-    #valid_embedding_data = load_data(os.path.join(data_dir, 'clap-valid-embeddings.pkl'))
-
-    # concatinate datasets
-    train_combined = {
-        key: (train_data[key], train_embedding_data[key])
-        for key in train_data
-        if key in train_embedding_data
-    }
-
-    # valid_combined = {
-    #     key: (valid_data[key], valid_embedding_data[key])
-    #     for key in valid_data
-    # }
+    # load tokenized dataset
+    train_dataset = torch.load(os.path.join(data_dir, 'distil-train-tokenized.pkl'))
+    valid_dataset = torch.load(os.path.join(data_dir, 'distil-valid-tokenized.pkl'))
 
     # load tokenizer
     tokenizer = AsmTokenizer(vocab_file=os.path.join(data_dir, f"baseline-vocab.txt"))
     print(f"Vocab size: {len(tokenizer.vocab)}")
 
-    # prepare instructions for BERT
-    train_data = prepare_dataset_for_bert(train_combined, tokenizer, max_len, seq_len, total_seq_len)
-    #valid_data = prepare_dataset_for_bert(valid_combined, tokenizer, max_len, seq_len, total_seq_len)
-
-    # dataset
-    train_dataset = DistillDatasetTruncPadParts(train_data)
-    #valid_dataset = DistillDatasetTruncPadParts(valid_data)
 
     def collate_fn(batch):
         # need to stack data pairs into one function
@@ -310,7 +220,7 @@ if __name__=="__main__":
 
     # create dataloaders
     train_dataloder = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-    #valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
 
     # load model
     bert_model = BERT(
@@ -336,8 +246,9 @@ if __name__=="__main__":
         projector=projector,
         train_dataloader=train_dataloder,
         max_len=max_len,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         total_seq_len=total_seq_len,
-        #valid_dataloader=valid_dataloader,
+        valid_dataloader=valid_dataloader,
         num_epochs=epochs,
         model_save_path=os.path.join(data_dir, f"distil-model"),
         projector_save_path=os.path.join(data_dir, f'projector-layer'),
