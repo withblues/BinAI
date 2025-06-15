@@ -1,5 +1,6 @@
 import os
 import pickle
+import json
 
 
 def load_data(dir_path: str):
@@ -10,3 +11,8 @@ def load_data(dir_path: str):
     print(f'loaded {dir_path} to disk')
     return data
 
+def load_json(dir_path: str):
+    with open(dir_path) as f:
+        data = json.load(f)
+
+    return data
