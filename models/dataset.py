@@ -79,13 +79,3 @@ class PrecomputeDataset(Dataset):
         key = self.keys[idx]
         instructions = self.data[key]
         return key, instructions
-
-class DistillDatasetTruncPadParts(Dataset):
-    def __init__(self, list_of_prepared_function_data):
-        self.data = list_of_prepared_function_data
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        return self.data[idx]
