@@ -1,15 +1,17 @@
 import argparse
-import pickle
 import torch
-from utils.data import load_data
+from utils.data import load_data, load_json
 import os
 from models.tokenizer import AsmTokenizer
-from models.dataset import DistillDatasetTruncPadParts
 from models.bert import BERT
 from torch.utils.data import DataLoader
 from torch.optim import Adam
 import tqdm
 from torch import nn
+import webdataset as wds
+import torch.nn.utils.rnn as rnn_utils
+import glob
+from functools import partial
 
 
 
@@ -19,7 +21,6 @@ class DistillTrainer:
             bert_model,
             projector,
             train_dataloader,
-            max_len,
             total_seq_len,
             gradient_accumulation_steps,
             valid_dataloader=None,
@@ -39,7 +40,6 @@ class DistillTrainer:
         self.valid_dataloader = valid_dataloader
 
         # hyperparameters
-        self.max_len = max_len
         self.total_seq_len = total_seq_len
         self.gradient_accumulation_steps = gradient_accumulation_steps
         
@@ -49,7 +49,7 @@ class DistillTrainer:
             betas=betas,
             weight_decay=weight_decay,
         )
-        self.optim_schedul = torch.optim.lr_scheduler.OneCycleLR(
+        self.optim_schedule = torch.optim.lr_scheduler.OneCycleLR(
             self.optim,
             max_lr=1e-3,
             steps_per_epoch=len(train_dataloader),
@@ -64,9 +64,10 @@ class DistillTrainer:
         self.avg_loss = float('inf')
         self.model_save_path = model_save_path
         self.projector_save_path = projector_save_path
+
+        # print params
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad) + \
                    sum(p.numel() for p in self.projector.parameters() if p.requires_grad)
-
         print("Trainable Parameters:", trainable_params)
 
     def train(self, epoch):
@@ -101,54 +102,54 @@ class DistillTrainer:
 
         for i, batch_dict in enumerate(data_iter):
             student_all_parts_batched = batch_dict["student_instruction"].to(self.device)
-            parts_attention_mask_batch = batch_dict["student_attention_mask"].to(self.device)
+            attention_mask_batched = batch_dict["student_attention_mask"].to(self.device)
             teacher_embeddings_batch = batch_dict["teacher_embedding"].to(self.device)
 
-            current_dataloader_batch_size = student_all_parts_batched.size(0)
+            current_dataloader_batch_size, dynamic_max_len, _ = student_all_parts_batched.shape
 
             with torch.set_grad_enabled(train):
-                # 1. Reshape student inputs from [batchs_size, max_len, total_seq_len] -> [batch_size * max_len, total_seq_len]
+                # reshape student inputs from [batchs_size, max_len, total_seq_len] -> [batch_size * max_len, total_seq_len]
                 reshaped_input_for_encode = student_all_parts_batched.view(
-                    current_dataloader_batch_size * self.max_len,
+                    current_dataloader_batch_size * dynamic_max_len,
                     self.total_seq_len
                 )
                 
-                # 2. Encode all parts
+                # encode all parts
                 encoded_all_parts = self.model.encode(reshaped_input_for_encode)
 
-                # 3. Reshape back to [batch_size, max_len, bert_dimension]
+                # reshape back to [batch_size, max_len, bert_dimension]
                 encoded_parts_batched_view = encoded_all_parts.view(
                     current_dataloader_batch_size,
-                    self.max_len,
+                    dynamic_max_len,
                     128
                 )
 
-                # 4. Masked Summation so we discard padded instructions
-                attention_mask_expanded = parts_attention_mask_batch.unsqueeze(-1)
+                # masked summation so we discard padded instructions
+                attention_mask_expanded = attention_mask_batched.unsqueeze(-1)
                 masked_encoded_parts = encoded_parts_batched_view * attention_mask_expanded
                 student_summed_function_embeddings = torch.sum(masked_encoded_parts, dim=1)
 
-                # 5. Project teacher embeddings and calculate loss
+                # project teacher embeddings and calculate loss
                 projected_teacher_embeddings = self.projector(teacher_embeddings_batch)
                 loss = self.criterion(student_summed_function_embeddings, projected_teacher_embeddings)
 
             if train:
                 loss = loss / self.gradient_accumulation_steps
-                loss.backwards()
+                loss.backward()
 
-                # 3. backward and optimization only in train and if accumulation steps
+                # backward and optimization only in train and if accumulation steps
                 if (i + 1) % self.gradient_accumulation_steps == 0 or (i + 1) == len(data_loader):
                     self.optim.step()
                     self.optim_schedule.step()
                     self.optim.zero_grad()
 
-            avg_loss += loss.item() * gradient_accumulation_steps
+            avg_loss += loss.item() * self.gradient_accumulation_steps
 
             post_fix = {
                 "epoch": epoch,
                 "iter": i,
                 "avg_loss": avg_loss / (i + 1),
-                "loss": loss.item() * gradient_accumulation_steps
+                "loss": loss.item() * self.gradient_accumulation_steps
             }
 
             if i % self.log_freq == 0:
@@ -165,10 +166,9 @@ if __name__=="__main__":
     parser = argparse.ArgumentParser(description="Command line parameters")
     parser.add_argument('--data_dir', required=True)
     parser.add_argument('--output_dir', required=True)
-    parser.add_argument('--max_len', default=256)
     parser.add_argument('--seq_len', default=16)
-    parser.add_argument('--batch_size', default=8)
-    parser.add_argument('--gradient_accumulation_steps', default=8)
+    parser.add_argument('--batch_size', default=64)
+    parser.add_argument('--gradient_accumulation_steps', default=1)
     args = parser.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -176,51 +176,97 @@ if __name__=="__main__":
     output_dir = args.output_dir
 
     # parameters for training
-    max_len = args.max_len
     seq_len = args.seq_len
     # seq_len * 2 (data pairs) + [CLS] + [SEQ] + [SEQ]
     total_seq_len = seq_len * 2 + 3
     batch_size = args.batch_size
     gradient_accumulation_steps = args.gradient_accumulation_steps
 
-    # load tokenized dataset
-    train_dataset = torch.load(os.path.join(data_dir, 'distil-train-tokenized.pkl'))
-    valid_dataset = torch.load(os.path.join(data_dir, 'distil-valid-tokenized.pkl'))
-
     # load tokenizer
     tokenizer = AsmTokenizer(vocab_file=os.path.join(data_dir, f"baseline-vocab.txt"))
+    PAD_ID = tokenizer.vocab['[PAD]']
     print(f"Vocab size: {len(tokenizer.vocab)}")
 
+    # load teacher embeddings 
+    train_teacher_data = load_data(os.path.join(data_dir, 'clap-train-embeddings.pkl'))
+    valid_teacher_data = load_data(os.path.join(data_dir, 'clap-valid-embeddings.pkl'))
 
-    def collate_fn(batch):
-        # need to stack data pairs into one function
-        func_ids = [item["function_id"] for item in batch]
-        stacked_instruction = torch.stack(
-            [torch.stack(item["student_instruction"], dim=0) for item in batch],
-            dim=0
+    # teacher mapping
+    def map_teacher_data(sample, embedding_dict):
+        function_id = int(sample['__key__'])
+
+        if function_id in embedding_dict:
+            sample["teacher_embedding"] = torch.from_numpy(embedding_dict[function_id])
+            return sample
+        
+        else:
+            return None
+        
+    # student dataset paths
+    shard_dir_train = os.path.join(data_dir, 'distil-train-tokenized-shards')
+    shard_dir_valid = os.path.join(data_dir, 'distil-valid-tokenized-shards')
+
+    train_urls = glob.glob(os.path.join(shard_dir_train, 'shards--*.tar.zstd'))
+    valid_urls = glob.glob(os.path.join(shard_dir_valid, 'shards--*.tar.zstd'))
+
+    # load lengths of the dataset
+    train_metadata = load_json(os.path.join(shard_dir_train, 'metadata.json')) 
+    train_length = train_metadata['total_samples']
+    valid_metadata = load_json(os.path.join(shard_dir_valid, 'metadata.json')) 
+    valid_length = valid_metadata['total_samples']
+
+    # load webdataset
+    train_dataset = (
+        wds.WebDataset(train_urls, resampled=True)
+        .shuffle(1000)
+        .decode('torch')
+        .map(partial(map_teacher_data, embedding_dict=train_teacher_data))
+        .with_length(train_length)
+    )
+
+
+    valid_dataset = (
+        wds.WebDataset(valid_urls)
+        .decode("torch")
+        .map(partial(map_teacher_data, embedding_dict=valid_teacher_data))
+        .with_length(valid_length)
+    )
+
+    # pad the students to same length
+    def pad_collate_fn(batch, pad_token_id):
+        # collect data
+        student_tensors = [sample['student.pth'].long() for sample in batch]
+        teacher_embeddings = [sample['teacher_embedding'] for sample in batch]
+        
+        # create attention mask
+        attention_masks = [torch.ones(t.shape[0], dtype=torch.uint8) for t in student_tensors]
+
+        # pad the student tensors to the max length in this specific batch
+        student_instructions_padded = rnn_utils.pad_sequence(
+            student_tensors, 
+            batch_first=True, 
+            padding_value=pad_token_id
         )
 
-        stacked_attention_mask = torch.stack(
-            [item["student_attention_mask"] for item in batch],
-            dim=0
+        # pad the attention masks to the same length
+        student_attention_masks_padded = rnn_utils.pad_sequence(
+            attention_masks, 
+            batch_first=True, 
+            padding_value=0 
         )
 
-        stacked_embedding = torch.stack(
-            [item["teacher_embedding"] for item in batch],
-            dim=0
-        )
-    
+        # stack the teacher embeddings
+        teacher_embeddings_stacked = torch.stack(teacher_embeddings, dim=0)
+
         return {
-            'function_id': func_ids,
-            'student_instruction': stacked_instruction,
-            'student_attention_mask': stacked_attention_mask,
-            'teacher_embedding': stacked_embedding
+            'student_instruction': student_instructions_padded,
+            'student_attention_mask': student_attention_masks_padded,
+            'teacher_embedding': teacher_embeddings_stacked
         }
 
-
-    # create dataloaders
-    train_dataloder = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-    valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    collate_with_pad = partial(pad_collate_fn, pad_token_id=PAD_ID)
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, collate_fn=collate_with_pad)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size, collate_fn=collate_with_pad)
 
     # load model
     bert_model = BERT(
@@ -234,7 +280,7 @@ if __name__=="__main__":
     bert_model.load_state_dict(torch.load(os.path.join(data_dir, f'baseline-model'), map_location=torch.device('cpu')))
 
     # get d_size of teacher
-    teacher_d_size = train_embedding_data[0].shape[0]
+    teacher_d_size = train_teacher_data[0].shape[0]
 
     # create projector
     projector = nn.Linear(teacher_d_size, 128)
@@ -244,8 +290,7 @@ if __name__=="__main__":
     distil_trainer = DistillTrainer(
         bert_model=bert_model,
         projector=projector,
-        train_dataloader=train_dataloder,
-        max_len=max_len,
+        train_dataloader=train_dataloader,
         gradient_accumulation_steps=gradient_accumulation_steps,
         total_seq_len=total_seq_len,
         valid_dataloader=valid_dataloader,
