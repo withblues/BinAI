@@ -143,17 +143,19 @@ class DistillTrainer:
                     self.optim_schedule.step()
                     self.optim.zero_grad()
 
-            avg_loss += loss.item() * self.gradient_accumulation_steps
-
-            post_fix = {
-                "epoch": epoch,
-                "iter": i,
-                "avg_loss": avg_loss / (i + 1),
-                "loss": loss.item() * self.gradient_accumulation_steps
-            }
+                avg_loss += loss.item() * self.gradient_accumulation_steps
+            
+            else:
+                avg_loss += loss.item()
 
             if i % self.log_freq == 0:
-                data_iter.write(str(post_fix))
+                print(
+                    f"[{mode.upper()}] Epoch {epoch}, Iter {i}/{len(data_loader)} "
+                    f"| Avg Loss: {avg_loss / (i + 1):.6f}, "
+                    f"Current Loss: {loss.item() * self.gradient_accumulation_steps:.6f}",
+                    flush=True
+                )
+
         print(
             f"EP{epoch}, {mode}: \
 			avg_loss={avg_loss / len(data_iter)}"
