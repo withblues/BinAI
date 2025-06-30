@@ -8,6 +8,7 @@ from src.utils.model import EncoderModel
 import torch
 import json
 import time
+from src.utils.gpu_stats import GPU
 
 
 def load_assembly_data(instructions):
@@ -72,8 +73,12 @@ if __name__ == '__main__':
     embedding_dict = {}
     batch = []
     batch_keys = []
-    vram_usages = []
+    # metrics
     start_time = time.time()
+    gpu_monitor = GPU(interval=1.0)
+    gpu_monitor.start_measure()
+
+
     for key in tqdm(unique_keys, desc='creating batch ...'):
         try:
             asm = test_data[key]
@@ -91,14 +96,7 @@ if __name__ == '__main__':
         batch_keys.append(key)
  
         if len(batch) >= args.batch_size:
-            # vram profiling
-            torch.cuda.empty_cache()
-            mem_before = torch.cuda.memory_allocated(device)
-
             embeddings = encoder_model.compute_embeddings(batch)
-
-            mem_after = torch.cuda.memory_allocated(device)
-            vram_usages.append(mem_after - mem_before)
 
             # save embeddings
             for k, emb in zip(batch_keys, embeddings):
@@ -108,25 +106,24 @@ if __name__ == '__main__':
 
     # handle last batch
     if batch:
-        # profiling
-        torch.cuda.empty_cache()
-        mem_before = torch.cuda.memory_allocated(device)
-
         embeddings = encoder_model.compute_embeddings(batch)
-
-        mem_after = torch.cuda.memory_allocated(device)
-        vram_usages.append(mem_after - mem_before)
 
         for k, emb in zip(batch_keys, embeddings):
             embedding_dict[k] = emb
 
+    gpu_monitor.stop_measure()
     
     # save metadata
     data = {
         'time': time.time() - start_time,
-        'avg_vram': sum(vram_usages) / len(vram_usages)
+        'peak_memory': gpu_monitor.get_memory_usage(peak=True),
+        'avg_memory': gpu_monitor.get_memory_usage(average=True),
+        'peak_util': gpu_monitor.get_utilization(peak=True)*100,
+        'avg_util': gpu_monitor.get_utilization(average=True)*100
     }
 
+    output_dir = os.path.join(output_dir, 'inference')
+    os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, f'{model_type}-metadata.json'), 'w') as f:
         json.dump(data, f)
 
