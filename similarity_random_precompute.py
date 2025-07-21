@@ -1,5 +1,5 @@
 import argparse
-from utils.data import load_data
+from src.utils.data import load_data
 import os
 import numpy as np
 from tqdm import tqdm
