@@ -17,33 +17,34 @@ class BaseTrainer:
         num_epochs=20,
         patience=5,
         model_save_path="",
-        device='cuda',
+        device="cuda",
     ):
         self.device = device
-        self.model = bert_model.to(device) # BERT model is common
+        self.model = bert_model.to(device)  # BERT model is common
         self.train_dataloader = train_dataloader
         self.valid_dataloader = valid_dataloader
 
         self.total_seq_len = total_seq_len
         self.gradient_accumulation_steps = gradient_accumulation_steps
-        
+
         # early stopping
         self.patience = patience
-        self.best_loss = float('inf') # Renamed to best_loss for clarity
-        self.epochs_no_improve = 0    
+        self.best_loss = float("inf")  # Renamed to best_loss for clarity
+        self.epochs_no_improve = 0
         self.early_stop = False
 
         # logging
         self.writer = writer
-        self.num_epochs = num_epochs # Store for OneCycleLR
-        
+        self.num_epochs = num_epochs  # Store for OneCycleLR
+
         # model saving
         self.model_save_path = model_save_path
 
         # print params (will be overridden/extended in subclasses)
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        trainable_params = sum(
+            p.numel() for p in self.model.parameters() if p.requires_grad
+        )
         print(f"Base Trainer - Trainable BERT Parameters: {trainable_params}")
-
 
     def _initialize_optimizer_and_scheduler(self, lr, betas, weight_decay):
         """subclasses will implement this to define their specific optimizer and scheduler."""
@@ -53,7 +54,7 @@ class BaseTrainer:
         """subclasses will implement their specific forward/backward pass and loss calculation."""
         raise NotImplementedError
 
-    def train(self): # Modified to handle epoch loop internally
+    def train(self):  # Modified to handle epoch loop internally
         # inialize optimizer
         self._initialize_optimizer_and_scheduler(self.lr, self.betas, self.weight_decay)
 
@@ -70,13 +71,15 @@ class BaseTrainer:
                     self.best_loss = val_loss
                     self.epochs_no_improve = 0
                     torch.save(self.model.state_dict(), self.model_save_path)
-                    self._save_additional_models() # subclass for projector
+                    self._save_additional_models()  # subclass for projector
 
                 else:
                     self.epochs_no_improve += 1
                     if self.epochs_no_improve > self.patience:
                         self.early_stop = True
-                        print(f"Epoch {epoch}: Early stopping triggered. Validation loss did not improve for {self.patience} epochs.")
+                        print(
+                            f"Epoch {epoch}: Early stopping triggered. Validation loss did not improve for {self.patience} epochs."
+                        )
                         break
 
         except KeyboardInterrupt:
@@ -87,4 +90,3 @@ class BaseTrainer:
     def _save_additional_models(self):
         """Placeholder for saving specific models (like projector). Subclasses override this."""
         pass
-

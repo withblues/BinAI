@@ -4,7 +4,6 @@ import torch.nn.functional as F
 import torch.nn as nn
 
 
-
 class PositionalEmbedding(nn.Module):
     def __init__(self, max_len, d_model):
         super(PositionalEmbedding, self).__init__()
@@ -15,6 +14,7 @@ class PositionalEmbedding(nn.Module):
         seq_len = x.size(1)
         positions = torch.arange(seq_len, device=x.device).unsqueeze(0).expand_as(x)
         return self.pos_embedding(positions)
+
 
 class FeedForward(torch.nn.Module):
     "Implements FFN equation."
@@ -32,6 +32,7 @@ class FeedForward(torch.nn.Module):
         out = self.fc2(self.dropout(out))
         return out
 
+
 class ScaledDotProductAttention(nn.Module):
     def __init__(self, dropout=0.1, d_k=8):
         super(ScaledDotProductAttention, self).__init__()
@@ -39,7 +40,7 @@ class ScaledDotProductAttention(nn.Module):
         self.d_k = d_k
 
     def forward(self, query, key, value, mask=None):
-        assert(self.d_k == query.size(-1))
+        assert self.d_k == query.size(-1)
         scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.d_k)
         if mask is not None:
             scores = scores.masked_fill(mask == 0, -1e9)
@@ -47,6 +48,7 @@ class ScaledDotProductAttention(nn.Module):
         attn_weights = self.dropout(attn_weights)
 
         return torch.matmul(attn_weights, value), attn_weights
+
 
 class MultiHeadedAttention(nn.Module):
     def __init__(self, heads, d_model, dropout=0.1):
@@ -66,18 +68,22 @@ class MultiHeadedAttention(nn.Module):
     def forward(self, query, key, value, mask=None):
         B, L, _ = query.size()
 
-        Q = self.q_linear(query).view(B, L, self.heads, self.d_k).transpose(1, 2)  # [B, h, L, d_k]
+        Q = (
+            self.q_linear(query).view(B, L, self.heads, self.d_k).transpose(1, 2)
+        )  # [B, h, L, d_k]
         K = self.k_linear(key).view(B, L, self.heads, self.d_k).transpose(1, 2)
         V = self.v_linear(value).view(B, L, self.heads, self.d_k).transpose(1, 2)
 
         if mask is not None:
             pass
 
-
         attn_output, _ = self.attention(Q, K, V, mask)  # [B, h, L, d_k]
 
-        attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, self.d_model)  # [B, L, d_model]
+        attn_output = (
+            attn_output.transpose(1, 2).contiguous().view(B, L, self.d_model)
+        )  # [B, L, d_model]
         return self.out_proj(attn_output)
+
 
 class MaskedLanguageModel(torch.nn.Module):
     """
@@ -97,14 +103,9 @@ class MaskedLanguageModel(torch.nn.Module):
     def forward(self, x):
         return self.softmax(self.linear(x))
 
+
 class EncoderLayer(torch.nn.Module):
-    def __init__(
-            self,
-            d_model=768,
-            heads=12,
-            feed_forward_hidden=768 * 4,
-            dropout=0.1
-    ):
+    def __init__(self, d_model=768, heads=12, feed_forward_hidden=768 * 4, dropout=0.1):
         super(EncoderLayer, self).__init__()
         self.layernorm = torch.nn.LayerNorm(d_model)
         self.self_multihead = MultiHeadedAttention(heads, d_model)
@@ -115,7 +116,9 @@ class EncoderLayer(torch.nn.Module):
         # embeddings: (batch_size, max_len, d_model)
         # encoder mask: (batch_size, 1, 1, max_len)
         # result: (batch_size, max_len, d_model)
-        interacted = self.dropout(self.self_multihead(embeddings, embeddings, embeddings, mask))
+        interacted = self.dropout(
+            self.self_multihead(embeddings, embeddings, embeddings, mask)
+        )
         # residual layer
         interacted = self.layernorm(interacted + embeddings)
         # bottleneck
@@ -154,12 +157,15 @@ class BERTEmbedding(torch.nn.Module):
         x = token_embedding + position_embedding
         return self.dropout(x)
 
+
 class BERT(torch.nn.Module):
     """
     BERT model : Bidirectional Encoder Representations from Transformers.
     """
 
-    def __init__(self, vocab_size, d_model=768, n_layers=12, heads=12, dropout=0.1, device="cuda"):
+    def __init__(
+        self, vocab_size, d_model=768, n_layers=12, heads=12, dropout=0.1, device="cuda"
+    ):
         """
         :param vocab_size: vocab_size of total words
         :param hidden: BERT model hidden size
@@ -181,7 +187,11 @@ class BERT(torch.nn.Module):
 
         # multi-layers transformer blocks, deep network
         self.encoder_blocks = torch.nn.ModuleList(
-            [EncoderLayer(d_model, heads, d_model * 4, dropout) for _ in range(n_layers)])
+            [
+                EncoderLayer(d_model, heads, d_model * 4, dropout)
+                for _ in range(n_layers)
+            ]
+        )
         self.mask_lm = MaskedLanguageModel(self.d_model, vocab_size)
         self.device = device
 

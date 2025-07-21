@@ -1,6 +1,7 @@
 import os
 import re
 
+
 class AsmTokenizer:
     def __init__(self, corpus=None, vocab_file=None, max_vocab_size=5000):
         self.max_vocab_size = max_vocab_size

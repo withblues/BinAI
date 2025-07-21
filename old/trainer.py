@@ -11,37 +11,39 @@ from models.dataset import BERTDataset
 from models.bert import BERT
 from models.tokenizer import AsmTokenizer
 
+
 class BERTTrainer:
     def __init__(
-            self,
-            model,
-            train_dataloader,
-            test_dataloader=None,
-            valid_dataloader=None,
-            lr= 1e-5,
-            weight_decay=0.01,
-            betas=(0.9, 0.999),
-            log_freq=10,
-            num_epochs=20,
-            model_save_path="",
-            device='cuda'
+        self,
+        model,
+        train_dataloader,
+        test_dataloader=None,
+        valid_dataloader=None,
+        lr=1e-5,
+        weight_decay=0.01,
+        betas=(0.9, 0.999),
+        log_freq=10,
+        num_epochs=20,
+        model_save_path="",
+        device="cuda",
     ):
-
         self.device = device
         self.model = model.to(device)
         self.train_data = train_dataloader
         self.test_data = test_dataloader
         self.valid_data = valid_dataloader
 
-        self.optim = Adam(self.model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay)
+        self.optim = Adam(
+            self.model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay
+        )
         self.optim_schedule = torch.optim.lr_scheduler.OneCycleLR(
             self.optim,
             max_lr=1e-3,
             steps_per_epoch=len(train_dataloader),
             epochs=num_epochs,
             pct_start=0.1,
-            anneal_strategy='cos',
-            final_div_factor=1e2
+            anneal_strategy="cos",
+            final_div_factor=1e2,
         )
 
         # Using Negative Log Likelihood Loss function for predicting the masked_token
@@ -54,7 +56,7 @@ class BERTTrainer:
     def train(self, epoch):
         _ = self.iteration(epoch, self.train_data)
         avg_loss = self.iteration(epoch, self.valid_data, train=False)
-        if(avg_loss < self.avg_loss):
+        if avg_loss < self.avg_loss:
             self.avg_loss = avg_loss
             torch.save(self.model.state_dict(), self.model_save_path)
 
@@ -69,22 +71,25 @@ class BERTTrainer:
             enumerate(data_loader),
             desc="EP_%s:%d" % (mode, epoch),
             total=len(data_loader),
-            bar_format="{l_bar}{r_bar}"
+            bar_format="{l_bar}{r_bar}",
         )
 
         for i, data in data_iter:
             # 0. batch_data will be sent into the device(GPU or cpu)
             data = {key: value.to(self.device) for key, value in data.items()}
-            if(train):
+            if train:
                 self.model.train()
                 # 1. forward the masked_lm model
                 mask_lm_output = self.model.forward(data["bert_input"])
 
                 # 2-1. NLLLoss of predicting masked token word
                 # loss = self.criterion(mask_lm_output.transpose(1, 2), data["bert_label"])
-                loss = self.criterion(mask_lm_output.view(-1, mask_lm_output.size(-1)), data["bert_label"].view(-1))
+                loss = self.criterion(
+                    mask_lm_output.view(-1, mask_lm_output.size(-1)),
+                    data["bert_label"].view(-1),
+                )
                 # 3. backward and optimization only in train
-                #if train:
+                # if train:
                 self.optim.zero_grad()
                 loss.backward()
                 self.optim.step()
@@ -93,7 +98,9 @@ class BERTTrainer:
                 self.model.eval()
                 with torch.no_grad():
                     mask_lm_output = self.model.forward(data["bert_input"])
-                    loss = self.criterion(mask_lm_output.transpose(1, 2), data["bert_label"])
+                    loss = self.criterion(
+                        mask_lm_output.transpose(1, 2), data["bert_label"]
+                    )
 
             avg_loss += loss.item()
 
@@ -101,7 +108,7 @@ class BERTTrainer:
                 "epoch": epoch,
                 "iter": i,
                 "avg_loss": avg_loss / (i + 1),
-                "loss": loss.item()
+                "loss": loss.item(),
             }
 
             if i % self.log_freq == 0:
@@ -113,37 +120,38 @@ class BERTTrainer:
         return avg_loss
 
 
-
-if __name__=="__main__":
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Command line parameters")
-    parser.add_argument('--device', default="cuda", dest="device")
+    parser.add_argument("--device", default="cuda", dest="device")
     args = parser.parse_args()
     MAX_LEN = 64
     data_dir = ""
 
     binary = os.path.join(data_dir, "outputs", f"baseline-train.pkl")
-    with open(binary, 'rb') as c:
+    with open(binary, "rb") as c:
         data = pickle.load(c)
     results_string = []
     for i in data:
         results_string.extend(list(i))
 
-    tokenizer = AsmTokenizer(corpus=results_string, vocab_file=os.path.join(data_dir, "outputs", f"baseline-vocab.txt"))
+    tokenizer = AsmTokenizer(
+        corpus=results_string,
+        vocab_file=os.path.join(data_dir, "outputs", f"baseline-vocab.txt"),
+    )
     print(f"Vocab size: {len(tokenizer.vocab)}")
-
 
     def load_assembly_data(data):
         data_pairs = []
         for item in data:
-            for i in range(0, len(item)-1, 2):
-                data_pairs.append((item[i].strip(), item[i+1].strip()))
+            for i in range(0, len(item) - 1, 2):
+                data_pairs.append((item[i].strip(), item[i + 1].strip()))
         return data_pairs
 
     train_data = load_assembly_data(data)
     del data
     gc.collect()
     binary = os.path.join(data_dir, "outputs", f"baseline-valid.pkl")
-    with open(binary, 'rb') as c:
+    with open(binary, "rb") as c:
         data = pickle.load(c)
 
     valid_data = load_assembly_data(data)
@@ -157,12 +165,18 @@ if __name__=="__main__":
         n_layers=4,
         heads=2,
         dropout=0.2,
-        device=args.device
+        device=args.device,
     )
 
     epochs = 10
-    bert_trainer = BERTTrainer(bert_model, train_loader, valid_dataloader=valid_loader, num_epochs=epochs, model_save_path=os.path.join(data_dir, "outputs", f"baseline-model"), device=args.device)
-
+    bert_trainer = BERTTrainer(
+        bert_model,
+        train_loader,
+        valid_dataloader=valid_loader,
+        num_epochs=epochs,
+        model_save_path=os.path.join(data_dir, "outputs", f"baseline-model"),
+        device=args.device,
+    )
 
     for epoch in range(epochs):
         bert_trainer.train(epoch)

@@ -27,7 +27,7 @@ class GPU:
                     break
 
                 time.sleep(self.interval)
-        
+
         self.thread = threading.Thread(target=measure_gpu)
         self.thread.start()
 
@@ -35,18 +35,18 @@ class GPU:
         self.monitoring = False
         if self.thread:
             self.thread.join()
-    
+
     def clear_measurements(self):
         self.memory_usage = []
         self.utilization = []
-    
+
     def get_memory_usage(self, peak: bool = False, average: bool = True):
         if peak:
             return max(self.memory_usage)
-        if average: 
+        if average:
             return sum(self.memory_usage) / len(self.memory_usage)
         return self.memory_usage[-1]
-    
+
     def get_utilization(self, peak: bool = False, average: bool = False):
         if peak:
             return max(self.utilization)
