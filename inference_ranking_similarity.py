@@ -43,8 +43,7 @@ if __name__ == '__main__':
     model_type = args.model_type
 
     # load precomputed embeddings and create lookup table
-    dataset = load_from_disk(os.path.join('home_outputs', f'{model_type}-test-embeddings'))
-    #dataset = load_from_disk(os.path.join(data_dir, f'{model_type}-test-embeddings'))
+    dataset = load_from_disk(os.path.join(data_dir, 'inference/datasets',f'{model_type}-test-embeddings'))
     embedding_dict = {
         (row["function_name"], row["compiler"], row["version"], row["opt"], row["bin"]): np.array(row["embedding"], dtype=np.float32)
         for row in dataset
@@ -104,6 +103,9 @@ if __name__ == '__main__':
 
         
     print(f"processing complete. saving {len(results)} pairs to CSV...")
+    output_dir = os.path.join(output_dir, 'inference/cosine_similarity')
+    os.makedirs(output_dir, exist_ok=True)
+
     output_df = pd.DataFrame(results)
     output_df.to_csv(os.path.join(output_dir, f'{model_type}-results-cosine.csv'), index=False)
     print("Done.")
