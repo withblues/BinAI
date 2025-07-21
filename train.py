@@ -3,13 +3,13 @@ import torch
 import os
 from src.models.tokenizer import AsmTokenizer
 from src.models.bert import BERT
-from torch.utils.data import DataLoader, Subset
+from src.models.projector import MLPProjector
+from torch.utils.data import DataLoader
 from torch.nn import Linear
 from functools import partial
 from torch.utils.tensorboard import SummaryWriter
 from datasets import load_from_disk
 from src.models.dataset import CombinedDataset
-from src.trainers.base_trainer import BaseTrainer
 from src.trainers.distill_trainer import DistillTrainer 
 from src.trainers.ranking_trainer import RankingTrainer
 from src.utils.data import load_data 
@@ -122,10 +122,6 @@ if __name__ == "__main__":
         # create combined datasets
         train_dataset_combined = CombinedDataset(train_dataset_raw, train_teacher_data)
         valid_dataset_combined = CombinedDataset(valid_dataset_raw, valid_teacher_data)
-
-        # TODO
-        # train_dataset_combined = Subset(train_dataset_combined, range(min(64, len(train_dataset_combined))))
-        # valid_dataset_combined = Subset(valid_dataset_combined, range(min(64, len(valid_dataset_combined))))
         
         collate_func = partial(distill_collate_fn, pad_token_id=PAD_ID)
         train_dataloader = DataLoader(train_dataset_combined, batch_size=args.batch_size, collate_fn=collate_func, shuffle=True)
@@ -133,7 +129,7 @@ if __name__ == "__main__":
 
         # create projector
         teacher_d_size = train_teacher_data[0].shape[0]
-        projector = Linear(teacher_d_size, 128) # BERT hidden size is 128
+        projector = MLPProjector(128, teacher_d_size)
 
         log_dir = f'{output_dir}/distil/{args.mode}-logs'
         model_path = os.path.join(output_dir, 'distil/models')
@@ -166,10 +162,6 @@ if __name__ == "__main__":
         train_dataset_tokenized = load_from_disk(os.path.join(data_dir, 'distil/datasets', 'train-tokenized'))
         valid_dataset_anchor = load_from_disk(os.path.join(data_dir, 'clap/datasets', f'valid-function-pool-{args.function_pool}'))
         valid_dataset_tokenized = load_from_disk(os.path.join(data_dir, 'distil/datasets', 'valid-tokenized'))
-
-        # TODO
-        # train_dataset_anchor = Subset(train_dataset_anchor, range(min(64, len(train_dataset_anchor))))
-        # valid_dataset_anchor = Subset(valid_dataset_anchor, range(min(64, len(valid_dataset_anchor))))
 
         # create collate function for ranking mode
         collate_func_train = create_ranking_collate_fn(train_dataset_tokenized, PAD_ID)
@@ -208,7 +200,7 @@ if __name__ == "__main__":
     gpu_monitor.start_measure()
     trainer.train()
     
-    # save gpu statistics
+    # show gpu statistics
     gpu_monitor.stop_measure()
     print("\n--- GPU Usage Summary ---")
     if gpu_monitor.memory_usage:

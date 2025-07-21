@@ -27,7 +27,7 @@ class BaseTrainer:
         self.total_seq_len = total_seq_len
         self.gradient_accumulation_steps = gradient_accumulation_steps
         
-        # Early stopping
+        # early stopping
         self.patience = patience
         self.best_loss = float('inf') # Renamed to best_loss for clarity
         self.epochs_no_improve = 0    
@@ -65,7 +65,7 @@ class BaseTrainer:
                 self.writer.add_scalar("Loss/train", train_loss, epoch)
                 self.writer.add_scalar("Loss/val", val_loss, epoch)
 
-                # Early stopping and saving
+                # early stopping and saving
                 if val_loss < self.best_loss:
                     self.best_loss = val_loss
                     self.epochs_no_improve = 0

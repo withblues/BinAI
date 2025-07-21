@@ -38,7 +38,7 @@ class RankingTrainer(BaseTrainer):
         )
         self.criterion = torch.nn.MSELoss()
 
-        # Store these for optimizer initialization in base class
+        # store these for optimizer initialization in base class
         self.lr = lr
         self.betas = betas
         self.weight_decay = weight_decay
@@ -93,18 +93,23 @@ class RankingTrainer(BaseTrainer):
             n_unique , dynamic_max_len, _ = input_ids.shape
 
             with torch.set_grad_enabled(train):
+                # transform input into correct shape
                 reshaped_input_for_encode = input_ids.view(
                     n_unique * dynamic_max_len,
                     self.total_seq_len
                 )
 
+                # encoder forward pass
                 encoded_all_parts = self.model.encode(reshaped_input_for_encode)
+
+                # transform back
                 encoded_parts_batched_view = encoded_all_parts.view(
                     n_unique,
                     dynamic_max_len,
                     128
                 )
-            
+
+                # mean pooling
                 attention_mask_expanded = attention_mask.unsqueeze(-1)
                 function_summed_embeddings = (encoded_parts_batched_view * attention_mask_expanded).sum(dim=1)
 
@@ -114,9 +119,11 @@ class RankingTrainer(BaseTrainer):
                 anchor_embeddings = function_mean_embeddings[anchor_indices]
                 target_embeddings = function_mean_embeddings[target_indices]
                 
+                # normalize
                 anchor_norm = F.normalize(anchor_embeddings, dim=-1)
                 target_norm = F.normalize(target_embeddings, dim=-1)
 
+                # dot product -> cosine similarity score
                 predicted_cosine_similarity_scores = torch.einsum('bd,bkd->bk', anchor_norm, target_norm)
 
                 cosine_scores = cosine_scores.to(self.device)
@@ -128,6 +135,7 @@ class RankingTrainer(BaseTrainer):
                 loss = loss / self.gradient_accumulation_steps
                 loss.backward()
 
+                # gradient accumulation
                 if (i + 1) % self.gradient_accumulation_steps == 0 or (i + 1) == len(data_loader):
                     self.optim.step()
                     self.optim_schedule.step()

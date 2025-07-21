@@ -102,19 +102,23 @@ class DistillTrainer(BaseTrainer):
 
             current_dataloader_batch_size, dynamic_max_len, _ = student_all_parts_batched.shape
             with torch.set_grad_enabled(train):
+                # transform input in correct shape
                 reshaped_input_for_encode = student_all_parts_batched.view(
                     current_dataloader_batch_size * dynamic_max_len,
                     self.total_seq_len
                 )
                 
+                # forward pass
                 encoded_all_parts = self.model.encode(reshaped_input_for_encode)
 
+                # transform back
                 encoded_parts_batched_view = encoded_all_parts.view(
                     current_dataloader_batch_size,
                     dynamic_max_len,
                     128
                 )
 
+                # mean pooling
                 attention_mask_expanded = attention_mask_batched.unsqueeze(-1)
                 masked_encoded_parts = encoded_parts_batched_view * attention_mask_expanded
                 student_summed_function_embeddings = torch.sum(masked_encoded_parts, dim=1)
@@ -122,16 +126,19 @@ class DistillTrainer(BaseTrainer):
                 valid_counts = attention_mask_expanded.sum(dim=1).clamp(min=1e-5)
                 student_mean_function_embeddings = student_summed_function_embeddings / valid_counts
 
+                # normalization and projection layer forward pass
                 student_mean_function_embeddings = F.normalize(student_mean_function_embeddings, dim=1)
+                projected_student_embeddings = self.projector(student_mean_function_embeddings)
+                projected_student_embeddings = F.normalize(projected_student_embeddings, dim=1)
 
-                projected_teacher_embeddings = self.projector(teacher_embeddings_batch)
-                loss = self.criterion(student_mean_function_embeddings, projected_teacher_embeddings)
+                loss = self.criterion(projected_student_embeddings, teacher_embeddings_batch)
 
             if train:
                 loss_for_total_sum = loss.item() 
                 loss = loss / self.gradient_accumulation_steps
                 loss.backward()
 
+                # gradient accumulation
                 if (i + 1) % self.gradient_accumulation_steps == 0 or (i + 1) == len(data_loader):
                     self.optim.step()
                     self.optim_schedule.step()
