@@ -1,9 +1,10 @@
 from transformers import AutoModel, AutoTokenizer
-from models.tokenizer import AsmTokenizer
-from models.bert import BERT
+from src.models.tokenizer import AsmTokenizer
+from src.models.bert import BERT
 import torch
 import os
 import torch.nn.functional as F
+from src.models.projector import MLPProjector
 
 def simulate_BERTDataset_without_masking(data_pairs, tokenizer, seq_len):
     bert_inputs = []
@@ -43,13 +44,25 @@ class EncoderModel:
                 dropout=0.1,
                 device=device
             )
-
             if model_type == 'baseline':
                 self.model.load_state_dict(torch.load(os.path.join(data_dir, f'baseline-model'), map_location=torch.device('cpu')))
-            elif model_type == 'distil':
-                self.model.load_state_dict(torch.load(os.path.join(data_dir, f'distil-embedding-model.pt'), map_location=torch.device('cpu')))
-            elif model_type == 'ranking':
-                self.model.load_state_dict(torch.load(os.path.join(data_dir, f'distil-ranking-model.pt'), map_location=torch.device('cpu')))
+
+            model_path = os.path.join(data_dir, 'distil/models')
+            if 'distil' in model_type:
+                self.model.load_state_dict(torch.load(os.path.join(model_path, f'embedding-bert-model.pt'), map_location=torch.device('cpu')))
+                
+                # load projector
+                if model_type == 'distil_projected':
+                    print('loading projector')
+                    self.projector = MLPProjector(128, 768)
+                    self.projector.load_state_dict(torch.load(os.path.join(model_path, 'embedding-projector-layer.pt'), map_location=torch.device('cpu')))
+                    self.projector = self.projector.to(device)
+
+            elif model_type == 'ranking_random':
+                self.model.load_state_dict(torch.load(os.path.join(model_path, f'ranking-random-bert-model.pt'), map_location=torch.device('cpu')))
+            elif model_type == 'ranking_hard':
+                self.model.load_state_dict(torch.load(os.path.join(model_path, f'ranking-hard_mined-bert-model.pt'), map_location=torch.device('cpu')))
+
 
             self.model = self.model.to(device)
            
@@ -143,5 +156,10 @@ class EncoderModel:
 
                 # normalize
                 asm_embeddings = F.normalize(asm_embeddings, dim=1)
+
+                # upcast
+                if self.model_type == 'distil_projected':
+                    projected_student_embeddings = self.projector(asm_embeddings)
+                    asm_embeddings = F.normalize(projected_student_embeddings, dim=1)
 
                 return asm_embeddings.cpu().numpy()
