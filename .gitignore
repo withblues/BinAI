@@ -198,5 +198,5 @@ cython_debug/
 outputs
 download
 baseline-results-L1.csv
-*.ipynb
 *.out
+slurm
