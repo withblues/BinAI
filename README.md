@@ -81,7 +81,7 @@ python inference_ranking_similarity.py --data_dir outputs --output_dir outputs -
 
 To now evaluate on common metrics like NCDG@k / MRR / Precision@k we use this command which will calculate all metrics for all the trained models if their corresponding data is precomputed
  ```bash
-python inference_ranking_metrics.py --data_dir outputs --output_dir outputs --top_k 10
+python inference_similarity_metrics.py --data_dir outputs --output_dir outputs --top_k 10
 ```
 
 
