@@ -19,6 +19,7 @@ def compute_cross_project_split(dataset, seed=42, output_file="cross_project_spl
     random.seed(seed)
     
     projects = dataset["project"]
+    all_uids = dataset["unique_id"]
     
     # count rows per project
     project_counts = Counter(projects)
@@ -41,9 +42,10 @@ def compute_cross_project_split(dataset, seed=42, output_file="cross_project_spl
     train_projects = [p for p in PROJECT_LANGS.keys() if p not in val_projects + test_projects]
     
     # get indices
-    train_idx = [i for i, p in enumerate(projects) if p in train_projects]
-    val_idx = [i for i, p in enumerate(projects) if p in val_projects]
-    test_idx = [i for i, p in enumerate(projects) if p in test_projects]
+    
+    train_idx = [i for i, p in zip(all_uids, projects) if p in train_projects]
+    val_idx = [i for i, p in zip(all_uids, projects) if p in val_projects]
+    test_idx = [i for i, p in zip(all_uids, projects) if p in test_projects]
     
     # Save indices
     with open(output_file, "w") as f:
@@ -66,10 +68,13 @@ def compute_cross_binary_split(dataset, seed=42, output_file="cross_binary_split
     train_bins = binaries[: int(n * 0.8)]
     val_bins = binaries[int(n * 0.8): int(n * 0.9)]
     test_bins = binaries[int(n * 0.9):]
+
+    all_uids = dataset["unique_id"]
+    binary_names = dataset["binary_name"]
     
-    train_idx = [i for i, b in enumerate(dataset["binary_name"]) if b in train_bins]
-    val_idx = [i for i, b in enumerate(dataset["binary_name"]) if b in val_bins]
-    test_idx = [i for i, b in enumerate(dataset["binary_name"]) if b in test_bins]
+    train_idx = [i for i, b in zip(all_uids, binary_names) if b in train_bins]
+    val_idx = [i for i, b in zip(all_uids, binary_names) if b in val_bins]
+    test_idx = [i for i, b in zip(all_uids, binary_names) if b in test_bins]
     
     # Save indices
     with open(output_file, "w") as f:
