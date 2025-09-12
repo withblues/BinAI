@@ -21,8 +21,10 @@ def generate_random_indices(num_rows, top_k, seed=42):
 def process_batch(batch_embeddings, batch_indices, split_ids_list):
     # batch_embeddings: (batch_size, dim)
     # batch_indices: (batch_size, top_k)
-    target_embeddings = embeddings[batch_indices]  # shape: (batch_size, top_k, dim)
-    cosine_scores = np.einsum('bd,bkd->bk', batch_embeddings, target_embeddings)
+    batch_embeddings_slice = split_embeddings[start:end]  # (batch_size, dim)
+    batch_indices_slice = target_indices[start:end]       # (batch_size, top_k)
+    target_embeddings_slice = split_embeddings[batch_indices_slice]  # (batch_size, top_k, dim)
+    cosine_scores = np.einsum('bd,bkd->bk', batch_embeddings_slice, target_embeddings_slice)
 
     # map indices to unique_ids
     target_ids = np.array([[split_ids_list[idx] for idx in row] for row in batch_indices], dtype=object)
@@ -32,27 +34,24 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate random negative pools for embeddings.")
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--splits_dir", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, default="outputs/cosine_pools")
+    parser.add_argument("--output_dir", type=str, default="outputs/cosine_random_pool")
     parser.add_argument("--top_k", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=1024)
     args = parser.parse_args()
 
-    # --- Load full dataset once ---
+    # --- Load full dataset ---
     print(f"Loading full dataset from {args.data_dir}")
     dataset = load_from_disk(args.data_dir)
     if "clap_embedding" in dataset.column_names:
         dataset = dataset.rename_column("clap_embedding", "embedding")
 
-    # Materialize unique IDs first
+    # Materialize unique IDs and embeddings
     all_ids = list(dataset["unique_id"])
-
-    # Convert embeddings column to NumPy
     dataset.set_format("numpy", columns=["embedding"])
     embeddings = dataset[:]["embedding"]
     num_rows, dim = embeddings.shape
     print(f"Embeddings shape: {embeddings.shape}")
 
-    # Map unique_id -> row index for fast lookup
     id_to_index = {uid: i for i, uid in enumerate(all_ids)}
 
     # --- Process each split JSON ---
@@ -70,58 +69,42 @@ if __name__ == "__main__":
         with open(json_path, 'r') as f:
             split_ids_by_group = json.load(f)
 
-        # --- Combine train + val ---
-        combined_split_ids = []
-        combined_split_embeddings = []
-        combined_unique_ids = []
-        split_column = []
+        final_unique_ids = []
+        final_split_column = []
+        final_target_ids = []
+        final_cosine_scores = []
 
         for data_split in ["train", "val"]:
             if data_split not in split_ids_by_group:
                 continue
+
             split_ids = split_ids_by_group[data_split]
             split_indices = [id_to_index[uid] for uid in split_ids]
             split_embeddings = embeddings[split_indices]
             split_unique_ids = [all_ids[i] for i in split_indices]
 
-            combined_split_ids.extend(split_ids)
-            combined_split_embeddings.append(split_embeddings)
-            combined_unique_ids.extend(split_unique_ids)
-            split_column.extend([data_split] * len(split_ids))
+            # --- Generate random target indices within this split only ---
+            target_indices = generate_random_indices(len(split_indices), args.top_k)
 
-        combined_split_embeddings = np.vstack(combined_split_embeddings)
-        num_combined_rows = combined_split_embeddings.shape[0]
-        print(f"Combined train+val rows: {num_combined_rows}")
+            # --- Process in batches ---
+            batch_size = args.batch_size
+            for start in tqdm(range(0, len(split_indices), batch_size), desc=f"Processing {data_split} batches"):
+                end = min(start + batch_size, len(split_indices))
+                # batch_embeddings_slice = split_embeddings[start:end]
+                # batch_indices_slice = target_indices[start:end]
+                t_ids, scores = process_batch(split_embeddings, target_indices[start:end], split_unique_ids)
+                final_target_ids.extend(t_ids)
+                final_cosine_scores.extend(scores)
 
-        # --- Generate random target indices per split ---
-        all_target_indices = np.empty((num_combined_rows, args.top_k), dtype=np.int64)
-        start_idx = 0
-        for data_split in ["train", "val"]:
-            if data_split not in split_ids_by_group:
-                continue
-            split_ids = split_ids_by_group[data_split]
-            split_size = len(split_ids)
-            all_target_indices[start_idx:start_idx+split_size] = generate_random_indices(split_size, args.top_k)
-            start_idx += split_size
+            final_unique_ids.extend(split_unique_ids)
+            final_split_column.extend([data_split] * len(split_unique_ids))
 
-        # --- Process in batches ---
-        batch_size = args.batch_size
-        target_ids_list = []
-        cosine_scores_list = []
-        for start in tqdm(range(0, num_combined_rows, batch_size), desc="Processing combined train+val batches"):
-            end = min(start + batch_size, num_combined_rows)
-            batch_embeddings_slice = combined_split_embeddings[start:end]
-            batch_indices_slice = all_target_indices[start:end]
-            t_ids, scores = process_batch(batch_embeddings_slice, batch_indices_slice, combined_unique_ids)
-            target_ids_list.extend(t_ids)
-            cosine_scores_list.extend(scores)
-
-        # --- Build final dataset with split column ---
+        # --- Build final dataset ---
         final_ds = Dataset.from_dict({
-            "unique_id": combined_unique_ids,
-            "split": split_column,
-            "target_ids": target_ids_list,
-            "cosine_scores": cosine_scores_list
+            "unique_id": final_unique_ids,
+            "split": final_split_column,
+            "target_ids": final_target_ids,
+            "cosine_scores": final_cosine_scores
         })
 
         # --- Save combined dataset ---
@@ -131,7 +114,7 @@ if __name__ == "__main__":
         final_ds.save_to_disk(output_path)
 
         # Clean up
-        del combined_split_embeddings, combined_unique_ids, combined_split_ids, split_column, all_target_indices, target_ids_list, cosine_scores_list, final_ds
+        del final_ds, final_unique_ids, final_split_column, final_target_ids, final_cosine_scores
         gc.collect()
 
     print("\nAll splits processed successfully!")

@@ -112,3 +112,32 @@ class CombinedDataset(Dataset):
             "student_instruction": student_instruction,
             "teacher_embedding": teacher_embedding,
         }
+    
+    
+class CosineDataset(Dataset):
+    def __init__(self, dataset, lookup, id2idx):
+        self.dataset = dataset
+        self.lookup = lookup
+        self.id2idx = id2idx
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        anchor = self.dataset[idx]
+        target_ids, cosine_scores = self.lookup[anchor["unique_id"]]
+
+        input_ids = [anchor["input_ids"]]
+        attention_masks = [anchor["attention_mask"]]
+
+        for tid in target_ids:
+            t_idx = self.id2idx[tid]           
+            target_example = self.dataset[t_idx]
+            input_ids.append(target_example["input_ids"])
+            attention_masks.append(target_example["attention_mask"])
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_masks,
+            "labels": cosine_scores,
+        }
