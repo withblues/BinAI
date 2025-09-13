@@ -84,4 +84,45 @@ class StudentWithProjector(nn.Module):
             'loss': loss,
             'logits': s_proj
         }
+    
+class StudentWithCosine(nn.Module):
+    def __init__(self, student_model):
+        super().__init__()
+        self.student = student_model
+        self.criterion = nn.MSELoss()
+
+
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        # student model forward pass
+
+        print(f'shape of input_ids {input_ids.shape}')
+        print(f'shape of attention_mask {attention_mask.shape}')
+        outputs = self.student.bert(input_ids=input_ids, attention_mask=attention_mask)
+        s_cls = outputs.last_hidden_state[:, 0, :]
+        s_cls = F.normalize(s_cls, p=2, dim=-1)
+        print(f'output bert model shape {s_cls.shape}')
+
+        # split to anchor and multiple targets
+        batch_size = labels.shape[0]
+        num_targets = labels.shape[1]
+
+        grouped_embeddings = s_cls.view(batch_size, num_targets + 1, -1)
+
+        anchor_embeddings = grouped_embeddings[:, 0, :]
+        target_embeddings = grouped_embeddings[:, 1:, :]
+        print(f'embedding anchor {anchor_embeddings.shape}')
+        print(f'embedding target {target_embeddings.shape}')
+
+        # caculate cosine similarity 
+        predicted_scores = torch.einsum('bh,bkh->bk', anchor_embeddings, target_embeddings)
+
+        print(f'scores {predicted_scores.shape}')
+        loss = None
+        if labels is not None:
+            loss = self.criterion(predicted_scores, labels)
+
+        return {
+            "loss": loss,
+            "logits": predicted_scores
+        }
 

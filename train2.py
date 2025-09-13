@@ -5,8 +5,12 @@ import argparse
 import json
 from transformers import BertForMaskedLM, Trainer, TrainingArguments, BertTokenizerFast, DataCollatorForLanguageModeling
 import wandb
-from src.models.models import StudentWithProjector
+from src.models.models import StudentWithProjector, StudentWithCosine
 import torch
+from tqdm import tqdm
+from src.models.dataset import CosineDataset
+import numpy as np
+from transformers import AutoModelForMaskedLM
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train BERT on specific objective")
@@ -23,13 +27,23 @@ if __name__ == "__main__":
     data_dir = args.data_dir
     output_dir = args.output_dir
 
+    # handle caching map
+    cache_dir = os.path.join(args.data_dir, ".cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    train_cache_filter_path = os.path.join(cache_dir, 'dataset_filter', f"{args.split}_train.arrow")
+    val_cache_filter_path = os.path.join(cache_dir, 'dataset_filter', f"{args.split}_val.arrow")
+
     ### load dataset
     dataset = load_from_disk(os.path.join(data_dir, 'assembly_x64'))
     with open(os.path.join(data_dir, f"cross_{args.split}_split.json")) as f:
         indices = json.load(f)
 
-    train_dataset = dataset.select(indices["train"])
-    val_dataset = dataset.select(indices["val"])
+    train_ids = set(indices["train"])
+    val_ids = set(indices["val"])
+
+    train_dataset = dataset.filter(lambda batch: [uid in train_ids for uid in batch["unique_id"]], batched=True, num_proc=16, cache_file_name=train_cache_filter_path)
+    val_dataset = dataset.filter(lambda batch: [uid in val_ids for uid in batch["unique_id"]], batched=True, num_proc=16, cache_file_name=val_cache_filter_path)
+
 
     ### tokenizing
     # load custom tokenizer
@@ -37,53 +51,46 @@ if __name__ == "__main__":
 
     # postprocess dataset
     def format_and_tokenize(examples):
-        cls_id = tokenizer.cls_token_id
-        sep_id = tokenizer.sep_token_id
-        input_ids_list = []
-        max_len = 1024
+        sep_token = tokenizer.sep_token
+        cls_token = tokenizer.cls_token
+ 
+        texts = [
+            f"{cls_token} " + f" {sep_token} ".join(instr_list) + f" {sep_token}"
+            for instr_list in examples["instructions"]
+        ]
 
-        for instructions_list in examples['instructions']:
-            ids = [cls_id]
-            for instr in instructions_list:
-                ids += tokenizer.encode(instr, add_special_tokens=False)
-                ids += [sep_id]
-            
-            # Truncate the list of token IDs if it exceeds the max length
-            # We subtract 1 to account for the final SEP token that will be added.
-            if len(ids) > max_len:
-                ids = ids[:max_len]
-            
-            input_ids_list.append(ids)
-
-        # Use the tokenizer's built-in pad method
-        padded_output = tokenizer.pad(
-            {"input_ids": input_ids_list},
-            padding="max_length",
-            max_length=max_len,
-            return_tensors="pt"
+        # Let tokenizer add CLS at the start and SEP at the end
+        tokenized = tokenizer(
+            texts,
+            truncation=True,
+            max_length=1024,
         )
 
+
         return {
-            'input_ids': padded_output['input_ids'],
-            'attention_mask': padded_output['attention_mask'],
-            'labels': examples['clap_embedding']
+            "unique_id": examples["unique_id"],
+            "input_ids": tokenized["input_ids"],
+            "attention_mask": tokenized["attention_mask"],
+            "labels": examples["clap_embedding"],
+            "function_names": examples['function_name'],
+            'binary_name': examples['binary_name'],
         }
-    
+        
     # keep clap embedding for now
-    columns_to_remove = [c for c in train_dataset.column_names if c not in ['clap_embedding']]
+    columns_to_remove = [c for c in train_dataset.column_names if c not in ['unique_id']]
     
-    # handle caching map
-    cache_dir = os.path.join(args.data_dir, ".cache")
-    os.makedirs(cache_dir, exist_ok=True)
-    cache_file_path = os.path.join(cache_dir, f"{args.split}.arrow")
-    
-    train_dataset = train_dataset.map(format_and_tokenize, batched=True, num_proc=16, remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=cache_file_path)
-    val_dataset = val_dataset.map(format_and_tokenize, batched=True, num_proc=16, remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=cache_file_path)
+    train_cache_tokenization_path = os.path.join(cache_dir, 'tokenization', f"{args.split}_train.arrow")
+    val_cache_tokenization_path = os.path.join(cache_dir, 'tokenization', f"{args.split}_val.arrow")
+    train_dataset = train_dataset.map(format_and_tokenize, batched=True, num_proc=16, remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=train_cache_tokenization_path)
+    val_dataset = val_dataset.map(format_and_tokenize, batched=True, num_proc=16, remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=val_cache_tokenization_path)
 
     ### model
     student_model = BertForMaskedLM.from_pretrained(os.path.join(data_dir, f'bert_mlm_{args.split}', 'best_model'))
 
     if 'distil' in method:
+        train_dataset = train_dataset.remove_columns(["labels"])
+        val_dataset = val_dataset.remove_columns(["labels"])
+
         def custom_collate(features):
             batch = {}
             batch['input_ids'] = torch.stack([torch.tensor(f["input_ids"]) for f in features])
@@ -105,14 +112,89 @@ if __name__ == "__main__":
                 teacher_dim=768,
                 loss_fn='mse'
             )
+    
+    elif 'cosine' in method:
+        # drop unecessary columns
+        train_dataset = train_dataset.remove_columns(["labels", 'function_names', 'binary_name'])
+        val_dataset = val_dataset.remove_columns(["labels", 'function_names', 'binary_name'])
+
+        # load cosine dataset
+        dataset = load_from_disk(os.path.join(data_dir, 'cosine_random_pool', f'cross_{args.split}_split'))
+
+        train_cache_cosine_path = os.path.join(cache_dir, 'cosine_filter', f"{args.split}_train.arrow")
+        val_cache_cosine_path = os.path.join(cache_dir, 'cosine_filter', f"{args.split}_val.arrow")
+        train_cosine_dataset = dataset.filter(lambda batch: [uid in train_ids for uid in batch["unique_id"]], batched=True, num_proc=16, cache_file_name=train_cache_cosine_path, desc='filter dataset with keys')
+        val_cosine_dataset = dataset.filter(lambda batch: [uid in val_ids for uid in batch["unique_id"]], batched=True, num_proc=16, cache_file_name=val_cache_cosine_path, desc='filter dataset with keys')
+
+        ### build lookup table
+        # load cosine dataset into ram
+        train_cosine_dataset.set_format("numpy", columns=["unique_id", "target_ids", "cosine_scores"])
+        val_cosine_dataset.set_format("numpy", columns=["unique_id", "target_ids", "cosine_scores"])
+
+        train_cosine_cols = train_cosine_dataset[:]
+        val_cosine_cols = val_cosine_dataset[:]
+
+        train_cosine_lookup = {
+                int(uid): ([int(tid) for tid in targets], scores)
+                for uid, targets, scores in tqdm(
+                    zip(train_cosine_cols["unique_id"], train_cosine_cols["target_ids"], train_cosine_cols["cosine_scores"]),
+                    total=len(train_cosine_cols["unique_id"]),
+                    desc="Building train lookup"
+                )
+            }
+        
+        val_cosine_lookup = {
+                int(uid): ([int(tid) for tid in targets], scores)
+                for uid, targets, scores in tqdm(
+                    zip(val_cosine_cols["unique_id"], val_cosine_cols["target_ids"], val_cosine_cols["cosine_scores"]),
+                    total=len(val_cosine_cols["unique_id"]),
+                    desc="Building val lookup"
+                )
+            }
+        
+        ### build lookup table
+        final_train_uids = train_dataset["unique_id"]
+        final_val_uids = val_dataset["unique_id"]
+
+        train_id2idx = {uid: i for i, uid in tqdm(enumerate(final_train_uids), total=len(final_train_uids), desc="Building train id2idx")}
+        val_id2idx = {uid: i for i, uid in tqdm(enumerate(final_val_uids), total=len(final_val_uids), desc="Building val id2idx")}
+
+        train_dataset = CosineDataset(train_dataset, train_cosine_lookup, train_id2idx)
+        val_dataset = CosineDataset(val_dataset, val_cosine_lookup, val_id2idx)
+
+        def custom_collate(features):
+            all_input_ids = []
+            all_attention_masks = []
+            all_labels = []
+
+            # Loop through each example in the batch
+            for feature in features:
+                all_input_ids.extend(feature['input_ids'])
+                all_attention_masks.extend(feature['attention_mask'])
+                all_labels.append(feature['labels'])
+
+            # padding
+            padded_batch = tokenizer.pad(
+                {"input_ids": all_input_ids, "attention_mask": all_attention_masks},
+                padding='longest',
+                return_tensors='pt',
+            )
+
+            labels_np = np.array(all_labels)
+            batch_labels = torch.from_numpy(labels_np).float()
+            padded_batch['labels'] = batch_labels
+
+            return padded_batch
+        
+        model = StudentWithCosine(student_model)
 
 
     ### training
     # logging
-    wandb.init(
-        project=f"bert_{method}",
-        name=args.split
-    )
+    # wandb.init(
+    #     project=f"bert_{method}",
+    #     name=args.split
+    # )
 
     # output dir
     output_dir = os.path.join(output_dir, f"bert_{args.split}", method)
@@ -123,23 +205,32 @@ if __name__ == "__main__":
         output_dir=output_dir,
         overwrite_output_dir=True,
         eval_strategy="epoch",
-        save_strategy="epoch",
-        per_device_train_batch_size=32,
-        per_device_eval_batch_size=128,
-        gradient_accumulation_steps=4,
-        num_train_epochs=6,
-        logging_steps=100,
+        # save_strategy="epoch",
+        #eval_strategy='steps',
+
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=16,
+        gradient_accumulation_steps=16,
+        #num_train_epochs=6,
+        max_steps=100,
+        save_steps=5,
+        #eval_steps=10,
+        logging_steps=1,
         learning_rate=1e-5,
         weight_decay=0.01,
         warmup_ratio=0.1,
         tf32=True,
-        report_to='wandb',
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
-        dataloader_num_workers=4,
+        bf16=True,
+        #report_to='wandb',
+        #load_best_model_at_end=True,
+        #metric_for_best_model="eval_loss",
+        #greater_is_better=False,
         remove_unused_columns=False,
-        save_safetensors=False
+        save_safetensors=False,
+        dataloader_num_workers=8,
+        dataloader_pin_memory=True,
+        dataloader_prefetch_factor=2,
+        torch_compile=True,
     )
 
     # Trainer
@@ -153,7 +244,7 @@ if __name__ == "__main__":
     )
 
     # start training
-    trainer.train(resume_from_checkpoint=True)
+    trainer.train(resume_from_checkpoint='outputs/bert_project/random_cosine/checkpoint-2')
 
     torch.save(model.student.state_dict(), os.path.join(output_dir, 'student.pth'))
 
