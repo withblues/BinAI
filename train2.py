@@ -1,16 +1,15 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 from datasets import load_from_disk
 import argparse
 import json
-from transformers import BertForMaskedLM, Trainer, TrainingArguments, BertTokenizerFast, DataCollatorForLanguageModeling
+from transformers import BertForMaskedLM, Trainer, TrainingArguments, BertTokenizerFast, DataCollatorWithPadding
 import wandb
 from src.models.models import StudentWithProjector, StudentWithCosine
 import torch
 from tqdm import tqdm
 from src.models.dataset import CosineDataset
 import numpy as np
-from transformers import AutoModelForMaskedLM
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train BERT on specific objective")
@@ -63,10 +62,9 @@ if __name__ == "__main__":
         tokenized = tokenizer(
             texts,
             truncation=True,
-            max_length=1024,
+            max_length=128,
         )
-
-
+        
         return {
             "unique_id": examples["unique_id"],
             "input_ids": tokenized["input_ids"],
@@ -88,17 +86,10 @@ if __name__ == "__main__":
     student_model = BertForMaskedLM.from_pretrained(os.path.join(data_dir, f'bert_mlm_{args.split}', 'best_model'))
 
     if 'distil' in method:
-        train_dataset = train_dataset.remove_columns(["labels"])
-        val_dataset = val_dataset.remove_columns(["labels"])
+        train_dataset = train_dataset.remove_columns(["function_names", "binary_name", "unique_id"])
+        val_dataset = val_dataset.remove_columns(["function_names", "binary_name", "unique_id"])
 
-        def custom_collate(features):
-            batch = {}
-            batch['input_ids'] = torch.stack([torch.tensor(f["input_ids"]) for f in features])
-            batch['attention_mask'] = torch.stack([torch.tensor(f["attention_mask"]) for f in features])
-
-            batch["labels"] = torch.stack([torch.tensor(f["clap_embedding"]) for f in features])
-
-            return batch
+        custom_collate = DataCollatorWithPadding(tokenizer=tokenizer, padding='longest')
         
         if method == 'cosine_distil':
             model = StudentWithProjector(
@@ -189,12 +180,12 @@ if __name__ == "__main__":
         model = StudentWithCosine(student_model)
 
 
-    ### training
-    # logging
-    # wandb.init(
-    #     project=f"bert_{method}",
-    #     name=args.split
-    # )
+    ## training
+    #logging
+    wandb.init(
+        project=f"bert_{method}",
+        name=args.split
+    )
 
     # output dir
     output_dir = os.path.join(output_dir, f"bert_{args.split}", method)
@@ -204,27 +195,23 @@ if __name__ == "__main__":
     training_args = TrainingArguments(
         output_dir=output_dir,
         overwrite_output_dir=True,
-        eval_strategy="epoch",
-        # save_strategy="epoch",
-        #eval_strategy='steps',
-
-        per_device_train_batch_size=8,
-        per_device_eval_batch_size=16,
-        gradient_accumulation_steps=16,
-        #num_train_epochs=6,
-        max_steps=100,
-        save_steps=5,
-        #eval_steps=10,
+        save_strategy="steps",
+        save_steps=0.20,
+        eval_strategy='steps',
+        eval_steps=0.20,
+        per_device_train_batch_size=32,
+        per_device_eval_batch_size=32,
+        gradient_accumulation_steps=4,
+        num_train_epochs=6,
         logging_steps=1,
         learning_rate=1e-5,
         weight_decay=0.01,
         warmup_ratio=0.1,
         tf32=True,
-        bf16=True,
-        #report_to='wandb',
-        #load_best_model_at_end=True,
-        #metric_for_best_model="eval_loss",
-        #greater_is_better=False,
+        report_to='wandb',
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
         remove_unused_columns=False,
         save_safetensors=False,
         dataloader_num_workers=8,
@@ -244,7 +231,7 @@ if __name__ == "__main__":
     )
 
     # start training
-    trainer.train(resume_from_checkpoint='outputs/bert_project/random_cosine/checkpoint-2')
+    trainer.train()
 
     torch.save(model.student.state_dict(), os.path.join(output_dir, 'student.pth'))
 
