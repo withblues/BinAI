@@ -39,6 +39,9 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=1024)
     args = parser.parse_args()
 
+    random.seed(42)
+    np.random.seed(42)
+
     # --- Load full dataset ---
     print(f"Loading full dataset from {args.data_dir}")
     dataset = load_from_disk(args.data_dir)
