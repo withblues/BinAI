@@ -115,10 +115,11 @@ class CombinedDataset(Dataset):
     
     
 class CosineDataset(Dataset):
-    def __init__(self, dataset, lookup, id2idx):
+    def __init__(self, dataset, lookup, id2idx, technique):
         self.dataset = dataset
         self.lookup = lookup
         self.id2idx = id2idx
+        self.technique = technique
 
     def __len__(self):
         return len(self.dataset)
@@ -136,8 +137,13 @@ class CosineDataset(Dataset):
             input_ids.append(target_example["input_ids"])
             attention_masks.append(target_example["attention_mask"])
 
+        if self.technique == 'cosine':
+            labels = cosine_scores
+        elif self.technique == 'ft':
+            labels = 0
+
         return {
             "input_ids": input_ids,
             "attention_mask": attention_masks,
-            "labels": cosine_scores,
+            "labels": labels,
         }

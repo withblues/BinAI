@@ -1,11 +1,11 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 from datasets import load_from_disk
 import argparse
 import json
 from transformers import BertForMaskedLM, Trainer, TrainingArguments, BertTokenizerFast, DataCollatorWithPadding
 import wandb
-from src.models.models import StudentWithProjector, StudentWithCosine
+from src.models.models import StudentWithProjector, StudentWithCosine, StudentWithInfoNCE
 import torch
 from tqdm import tqdm
 from src.models.dataset import CosineDataset
@@ -19,7 +19,7 @@ if __name__ == "__main__":
     parser.add_argument("--method", default='mse_distil')
 
     args = parser.parse_args()
-
+    print(f'training on split {args.split} and method {args.method}')
     method = args.method
 
     # dirs
@@ -79,8 +79,8 @@ if __name__ == "__main__":
     
     train_cache_tokenization_path = os.path.join(cache_dir, 'tokenization', f"{args.split}_train.arrow")
     val_cache_tokenization_path = os.path.join(cache_dir, 'tokenization', f"{args.split}_val.arrow")
-    train_dataset = train_dataset.map(format_and_tokenize, batched=True, num_proc=16, remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=train_cache_tokenization_path)
-    val_dataset = val_dataset.map(format_and_tokenize, batched=True, num_proc=16, remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=val_cache_tokenization_path)
+    train_dataset = train_dataset.map(format_and_tokenize, batched=True, num_proc=os.cpu_count(), remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=train_cache_tokenization_path)
+    val_dataset = val_dataset.map(format_and_tokenize, batched=True, num_proc=os.cpu_count(), remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=val_cache_tokenization_path)
 
     ### model
     student_model = BertForMaskedLM.from_pretrained(os.path.join(data_dir, f'bert_mlm_{args.split}', 'best_model'))
@@ -104,18 +104,33 @@ if __name__ == "__main__":
                 loss_fn='mse'
             )
     
-    elif 'cosine' in method:
+    elif 'cosine' in method or 'ft' in method:
+        split = method.split('_')
+        sampling = split[-1]
+        technique = split[0]
+
+        ### model
+        if technique == 'cosine':
+            model = StudentWithCosine(student_model)
+            dataset_name = f'cosine_{sampling}'
+
+        elif technique == 'ft':
+            model = StudentWithInfoNCE(student_model, 10)
+            dataset_name = f'cosine_{sampling}_{technique}'
+
+        ### dataset
         # drop unecessary columns
         train_dataset = train_dataset.remove_columns(["labels", 'function_names', 'binary_name'])
         val_dataset = val_dataset.remove_columns(["labels", 'function_names', 'binary_name'])
 
-        # load cosine dataset
-        dataset = load_from_disk(os.path.join(data_dir, 'cosine_random_pool', f'cross_{args.split}_split'))
 
-        train_cache_cosine_path = os.path.join(cache_dir, 'cosine_filter', f"{args.split}_train.arrow")
-        val_cache_cosine_path = os.path.join(cache_dir, 'cosine_filter', f"{args.split}_val.arrow")
-        train_cosine_dataset = dataset.filter(lambda batch: [uid in train_ids for uid in batch["unique_id"]], batched=True, num_proc=16, cache_file_name=train_cache_cosine_path, desc='filter dataset with keys')
-        val_cosine_dataset = dataset.filter(lambda batch: [uid in val_ids for uid in batch["unique_id"]], batched=True, num_proc=16, cache_file_name=val_cache_cosine_path, desc='filter dataset with keys')
+        # load cosine dataset
+        dataset = load_from_disk(os.path.join(data_dir, f'{dataset_name}', f'cross_{args.split}_split'))
+
+        train_cache_cosine_path = os.path.join(cache_dir, f'{dataset_name}_filter', f"{args.split}_train.arrow")
+        val_cache_cosine_path = os.path.join(cache_dir, f'{dataset_name}_filter', f"{args.split}_val.arrow")
+        train_cosine_dataset = dataset.filter(lambda batch: [uid in train_ids for uid in batch["unique_id"]], batched=True, num_proc=os.cpu_count(), cache_file_name=train_cache_cosine_path, desc='filter dataset with keys')
+        val_cosine_dataset = dataset.filter(lambda batch: [uid in val_ids for uid in batch["unique_id"]], batched=True, num_proc=os.cpu_count(), cache_file_name=val_cache_cosine_path, desc='filter dataset with keys')
 
         ### build lookup table
         # load cosine dataset into ram
@@ -150,8 +165,8 @@ if __name__ == "__main__":
         train_id2idx = {uid: i for i, uid in tqdm(enumerate(final_train_uids), total=len(final_train_uids), desc="Building train id2idx")}
         val_id2idx = {uid: i for i, uid in tqdm(enumerate(final_val_uids), total=len(final_val_uids), desc="Building val id2idx")}
 
-        train_dataset = CosineDataset(train_dataset, train_cosine_lookup, train_id2idx)
-        val_dataset = CosineDataset(val_dataset, val_cosine_lookup, val_id2idx)
+        train_dataset = CosineDataset(train_dataset, train_cosine_lookup, train_id2idx, technique)
+        val_dataset = CosineDataset(val_dataset, val_cosine_lookup, val_id2idx, technique)
 
         def custom_collate(features):
             all_input_ids = []
@@ -177,7 +192,6 @@ if __name__ == "__main__":
 
             return padded_batch
         
-        model = StudentWithCosine(student_model)
 
 
     ## training
@@ -199,15 +213,15 @@ if __name__ == "__main__":
         save_steps=0.20,
         eval_strategy='steps',
         eval_steps=0.20,
-        per_device_train_batch_size=32,
-        per_device_eval_batch_size=32,
-        gradient_accumulation_steps=4,
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=16,
+        gradient_accumulation_steps=8,
         num_train_epochs=6,
-        logging_steps=1,
+        logging_steps=100,
         learning_rate=1e-5,
         weight_decay=0.01,
         warmup_ratio=0.1,
-        tf32=True,
+        #tf32=True,
         report_to='wandb',
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
