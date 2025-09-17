@@ -134,7 +134,7 @@ class StudentWithInfoNCE(nn.Module):
 
     def forward(self, input_ids, attention_mask=None, labels=None):
         # student model forward pass
-        outputs = self.student(input_ids=input_ids, attention_mask=attention_mask)
+        outputs = self.student.bert(input_ids=input_ids, attention_mask=attention_mask)
         token_embeddings = outputs.last_hidden_state
         
         # mean pooling

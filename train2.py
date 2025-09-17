@@ -8,7 +8,7 @@ import wandb
 from src.models.models import StudentWithProjector, StudentWithCosine, StudentWithInfoNCE
 import torch
 from tqdm import tqdm
-from src.models.dataset import CosineDataset
+from src.models.dataset import CosineDataset, InfoNCEDatasetWithLookup
 import numpy as np
 
 if __name__ == "__main__":
@@ -109,64 +109,116 @@ if __name__ == "__main__":
         sampling = split[-1]
         technique = split[0]
 
-        ### model
+        # drop unecessary columns
+        train_dataset = train_dataset.remove_columns(["labels", 'function_names', 'binary_name'])
+        val_dataset = val_dataset.remove_columns(["labels", 'function_names', 'binary_name'])
+        
+        
         if technique == 'cosine':
+            ### model
             model = StudentWithCosine(student_model)
             dataset_name = f'cosine_{sampling}'
 
         elif technique == 'ft':
+            ### dataset
             model = StudentWithInfoNCE(student_model, 10)
             dataset_name = f'cosine_{sampling}_{technique}'
 
-        ### dataset
-        # drop unecessary columns
-        train_dataset = train_dataset.remove_columns(["labels", 'function_names', 'binary_name'])
-        val_dataset = val_dataset.remove_columns(["labels", 'function_names', 'binary_name'])
-
-
         # load cosine dataset
         dataset = load_from_disk(os.path.join(data_dir, f'{dataset_name}', f'cross_{args.split}_split'))
-
+ 
+        # split data
         train_cache_cosine_path = os.path.join(cache_dir, f'{dataset_name}_filter', f"{args.split}_train.arrow")
         val_cache_cosine_path = os.path.join(cache_dir, f'{dataset_name}_filter', f"{args.split}_val.arrow")
-        train_cosine_dataset = dataset.filter(lambda batch: [uid in train_ids for uid in batch["unique_id"]], batched=True, num_proc=os.cpu_count(), cache_file_name=train_cache_cosine_path, desc='filter dataset with keys')
-        val_cosine_dataset = dataset.filter(lambda batch: [uid in val_ids for uid in batch["unique_id"]], batched=True, num_proc=os.cpu_count(), cache_file_name=val_cache_cosine_path, desc='filter dataset with keys')
+        train_cosine_dataset = dataset.filter(lambda batch: [uid in train_ids for uid in batch["unique_id"]], batched=True, num_proc=32, cache_file_name=train_cache_cosine_path, desc='filter dataset with keys')
+        val_cosine_dataset = dataset.filter(lambda batch: [uid in val_ids for uid in batch["unique_id"]], batched=True, num_proc=32, cache_file_name=val_cache_cosine_path, desc='filter dataset with keys')
 
-        ### build lookup table
-        # load cosine dataset into ram
-        train_cosine_dataset.set_format("numpy", columns=["unique_id", "target_ids", "cosine_scores"])
-        val_cosine_dataset.set_format("numpy", columns=["unique_id", "target_ids", "cosine_scores"])
+        if technique == 'cosine':
+            ### build lookup table
+            # load cosine dataset into ram
+            train_cosine_dataset.set_format("numpy", columns=["unique_id", "target_ids", "cosine_scores"])
+            val_cosine_dataset.set_format("numpy", columns=["unique_id", "target_ids", "cosine_scores"])
 
-        train_cosine_cols = train_cosine_dataset[:]
-        val_cosine_cols = val_cosine_dataset[:]
+            train_cosine_cols = train_cosine_dataset[:]
+            val_cosine_cols = val_cosine_dataset[:]
 
-        train_cosine_lookup = {
-                int(uid): ([int(tid) for tid in targets], scores)
-                for uid, targets, scores in tqdm(
-                    zip(train_cosine_cols["unique_id"], train_cosine_cols["target_ids"], train_cosine_cols["cosine_scores"]),
-                    total=len(train_cosine_cols["unique_id"]),
-                    desc="Building train lookup"
-                )
-            }
-        
-        val_cosine_lookup = {
-                int(uid): ([int(tid) for tid in targets], scores)
-                for uid, targets, scores in tqdm(
-                    zip(val_cosine_cols["unique_id"], val_cosine_cols["target_ids"], val_cosine_cols["cosine_scores"]),
-                    total=len(val_cosine_cols["unique_id"]),
-                    desc="Building val lookup"
-                )
-            }
-        
-        ### build lookup table
-        final_train_uids = train_dataset["unique_id"]
-        final_val_uids = val_dataset["unique_id"]
+            train_cosine_lookup = {
+                    int(uid): ([int(tid) for tid in targets], scores)
+                    for uid, targets, scores in tqdm(
+                        zip(train_cosine_cols["unique_id"], train_cosine_cols["target_ids"], train_cosine_cols["cosine_scores"]),
+                        total=len(train_cosine_cols["unique_id"]),
+                        desc="Building train lookup"
+                    )
+                }
+            
+            val_cosine_lookup = {
+                    int(uid): ([int(tid) for tid in targets], scores)
+                    for uid, targets, scores in tqdm(
+                        zip(val_cosine_cols["unique_id"], val_cosine_cols["target_ids"], val_cosine_cols["cosine_scores"]),
+                        total=len(val_cosine_cols["unique_id"]),
+                        desc="Building val lookup"
+                    )
+                }
+            
+            ### build lookup table
+            final_train_uids = train_dataset["unique_id"]
+            final_val_uids = val_dataset["unique_id"]
 
-        train_id2idx = {uid: i for i, uid in tqdm(enumerate(final_train_uids), total=len(final_train_uids), desc="Building train id2idx")}
-        val_id2idx = {uid: i for i, uid in tqdm(enumerate(final_val_uids), total=len(final_val_uids), desc="Building val id2idx")}
+            train_id2idx = {uid: i for i, uid in tqdm(enumerate(final_train_uids), total=len(final_train_uids), desc="Building train id2idx")}
+            val_id2idx = {uid: i for i, uid in tqdm(enumerate(final_val_uids), total=len(final_val_uids), desc="Building val id2idx")}
 
-        train_dataset = CosineDataset(train_dataset, train_cosine_lookup, train_id2idx, technique)
-        val_dataset = CosineDataset(val_dataset, val_cosine_lookup, val_id2idx, technique)
+            train_dataset = CosineDataset(train_dataset, train_cosine_lookup, train_id2idx)
+            val_dataset = CosineDataset(val_dataset, val_cosine_lookup, val_id2idx)
+
+        elif technique == 'ft':
+            train_cosine_dataset.set_format("numpy", columns=["unique_id", "positive_ids", "negative_ids"])
+            val_cosine_dataset.set_format("numpy", columns=["unique_id", "positive_ids", "negative_ids"])
+
+            # load into RAM
+            train_cosine_cols = train_cosine_dataset[:]
+            val_cosine_cols = val_cosine_dataset[:]
+
+            train_cosine_lookup = {}
+            for anchor, positives, negatives in tqdm(
+                zip(train_cosine_cols["unique_id"], train_cosine_cols["positive_ids"], train_cosine_cols["negative_ids"]),
+                total=len(train_cosine_cols["unique_id"]),
+                desc="Building FT train lookup"
+            ):
+                anchor_int = int(anchor)
+                if anchor_int not in train_cosine_lookup:
+                    train_cosine_lookup[anchor_int] = []
+                # Append a dictionary for this specific (positive, negatives) pair
+                for positive_id in positives:
+                    train_cosine_lookup[anchor_int].append({
+                        'positive_id': int(positive_id), 
+                        'negative_ids': [int(n) for n in negatives]
+                    })
+            val_cosine_lookup = {}
+            for anchor, positive, negatives in tqdm(
+                zip(val_cosine_cols["unique_id"], val_cosine_cols["positive_ids"], val_cosine_cols["negative_ids"]),
+                total=len(val_cosine_cols["unique_id"]),
+                desc="Building FT val lookup"
+            ):
+                anchor_int = int(anchor)
+                if anchor_int not in val_cosine_lookup:
+                    val_cosine_lookup[anchor_int] = []
+
+                for positive_id in positives:
+                    val_cosine_lookup[anchor_int].append({
+                        'positive_id': int(positive_id), 
+                        'negative_ids': [int(n) for n in negatives]
+                    })
+
+            ### build lookup table
+            final_train_uids = train_dataset["unique_id"]
+            final_val_uids = val_dataset["unique_id"]
+
+            train_id2idx = {uid: i for i, uid in tqdm(enumerate(final_train_uids), total=len(final_train_uids), desc="Building train id2idx")}
+            val_id2idx = {uid: i for i, uid in tqdm(enumerate(final_val_uids), total=len(final_val_uids), desc="Building val id2idx")}
+
+            train_dataset = InfoNCEDatasetWithLookup(train_dataset, train_cosine_lookup, train_id2idx, top_k=10)
+            val_dataset = InfoNCEDatasetWithLookup(val_dataset, val_cosine_lookup, val_id2idx, top_k=10)
+
 
         def custom_collate(features):
             all_input_ids = []
@@ -194,7 +246,7 @@ if __name__ == "__main__":
         
 
 
-    ## training
+    # training
     #logging
     wandb.init(
         project=f"bert_{method}",
@@ -213,15 +265,15 @@ if __name__ == "__main__":
         save_steps=0.20,
         eval_strategy='steps',
         eval_steps=0.20,
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=16,
-        gradient_accumulation_steps=8,
+        per_device_train_batch_size=128,
+        per_device_eval_batch_size=128,
+        gradient_accumulation_steps=1,
         num_train_epochs=6,
-        logging_steps=100,
+        logging_steps=1,
         learning_rate=1e-5,
         weight_decay=0.01,
         warmup_ratio=0.1,
-        #tf32=True,
+        tf32=True,
         report_to='wandb',
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
