@@ -1,4 +1,5 @@
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import json
 import numpy as np
 import argparse
@@ -9,12 +10,13 @@ import faiss
 import random
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="FAISS-First Hybrid dataset generation for fine-tuning.")
+    # ... (Arguments are the same) ...
+    parser = argparse.ArgumentParser(description="FAISS-based dataset generation for fine-tuning (1 positive vs k-1 negatives).")
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--splits_dir", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, default="outputs/cosine_faiss_ft")
+    parser.add_argument("--output_dir", type=str, default="outputs/cosine_faiss_ft_1_vs_k")
     parser.add_argument("--batch_size", type=int, default=4096)
-    parser.add_argument("--num_candidates_faiss", type=int, default=64, help="Number of candidates to initially retrieve from FAISS. Should be > top_k.")
+    parser.add_argument("--num_candidates_faiss", type=int, default=512, help="Number of candidates to initially retrieve from FAISS. A larger value finds better hard negatives.")
     parser.add_argument("--top_k", type=int, default=10, help="The final total number of targets for each anchor.")
     parser.add_argument("--split", type=str, default='project')
     args = parser.parse_args()
@@ -23,7 +25,7 @@ if __name__ == "__main__":
     np.random.seed(42)
     os.makedirs(args.output_dir, exist_ok=True)
     assert args.num_candidates_faiss > args.top_k, "--num_candidates_faiss must be greater than --top_k"
-
+    
     # --- Setup: Load full dataset once to create splits ---
     print("Loading full dataset to prepare splits...")
     original_dataset = load_from_disk(args.data_dir)
@@ -43,29 +45,36 @@ if __name__ == "__main__":
         split_dataset = original_dataset.filter(lambda x: x['unique_id'] in split_ids_set, num_proc=32)
         if len(split_dataset) == 0: continue
         
-        # --- PERFORMANCE OPTIMIZATION: Bulk extract all data into fast structures ---
+        # ... (Bulk data extraction is the same and correct) ...
         split_dataset.set_format("numpy", columns=['unique_id', 'binary_name', 'function_name', 'clap_embedding'])
         split_data_np = split_dataset[:]
         split_embeddings = split_data_np['clap_embedding'].astype('float32')
         split_all_ids = split_data_np['unique_id'].tolist()
-        # Create parallel lists for metadata - this is the key fix
         split_all_binary_names = split_data_np['binary_name'].tolist()
         split_all_function_names = split_data_np['function_name'].tolist()
-        # --------------------------------------------------------------------------
-        
         split_num_rows, dim = split_embeddings.shape
         split_id_to_index = {uid: i for i, uid in enumerate(split_all_ids)}
-        
         gt_lookup_split = {}
-        # Use the fast lists we just created
         for i in tqdm(range(split_num_rows), desc=f"Building {data_split} GT lookup"):
-            uid_int = int(split_all_ids[i])
-            b_name_str = str(split_all_binary_names[i])
-            f_name_str = str(split_all_function_names[i])
+            uid_int, b_name_str, f_name_str = int(split_all_ids[i]), str(split_all_binary_names[i]), str(split_all_function_names[i])
             if b_name_str not in gt_lookup_split: gt_lookup_split[b_name_str] = {}
             if f_name_str not in gt_lookup_split[b_name_str]: gt_lookup_split[b_name_str][f_name_str] = []
             gt_lookup_split[b_name_str][f_name_str].append(uid_int)
 
+        # --- Create a list of ANCHORS THAT ARE ACTUALLY VALID ---
+        # This is a pre-filtering step to improve efficiency
+        valid_anchor_indices = []
+        for idx in range(split_num_rows):
+             meta = {'binary_name': split_all_binary_names[idx], 'function_name': split_all_function_names[idx]}
+             all_gt = gt_lookup_split[meta['binary_name']][meta['function_name']]
+             if len(all_gt) > 1: # Check if there is at least one OTHER positive
+                 valid_anchor_indices.append(idx)
+        
+        valid_anchor_indices = np.array(valid_anchor_indices)
+        print(f"Found {len(valid_anchor_indices)} valid anchors with at least one positive pair.")
+
+        # --- Build FAISS index ---
+        # ... (FAISS building is the same and correct) ...
         nlist = max(1, min(4096, split_num_rows // 100))
         quantizer = faiss.IndexFlatIP(dim)
         cpu_index = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_INNER_PRODUCT)
@@ -75,48 +84,41 @@ if __name__ == "__main__":
         gpu_index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
         gpu_index.nprobe = 32
 
-        # --- Step 2: Process all anchors in the split ---
-        anchor_indices_in_split = np.arange(split_num_rows)
-        for start in tqdm(range(0, len(anchor_indices_in_split), args.batch_size), desc=f"Mining {data_split} batches"):
-            end = min(start + args.batch_size, len(anchor_indices_in_split))
-            batch_local_indices = anchor_indices_in_split[start:end]
+        # --- Step 2: Process ONLY the valid anchors ---
+        for start in tqdm(range(0, len(valid_anchor_indices), args.batch_size), desc=f"Mining {data_split} batches"):
+            end = min(start + args.batch_size, len(valid_anchor_indices))
+            batch_local_indices = valid_anchor_indices[start:end]
+            if len(batch_local_indices) == 0: continue
             batch_embeddings = split_embeddings[batch_local_indices]
             
             scores, indices = gpu_index.search(batch_embeddings, args.num_candidates_faiss)
 
             for i, anchor_local_idx in enumerate(batch_local_indices):
                 anchor_id = split_all_ids[anchor_local_idx]
-                
-                # --- PERFORMANCE OPTIMIZATION: Use fast list lookups ---
-                anchor_meta = {'binary_name': split_all_binary_names[anchor_local_idx], 
-                               'function_name': split_all_function_names[anchor_local_idx]}
+                anchor_meta = {'binary_name': split_all_binary_names[anchor_local_idx], 'function_name': split_all_function_names[anchor_local_idx]}
 
                 positives_found_by_faiss, negatives_found_by_faiss = [], []
                 for cand_local_idx, score in zip(indices[i], scores[i]):
                     if cand_local_idx == -1 or cand_local_idx == anchor_local_idx: continue
                     cand_id = split_all_ids[cand_local_idx]
-                    
-                    # Use fast list lookups here as well
-                    cand_meta = {'binary_name': split_all_binary_names[cand_local_idx], 
-                                 'function_name': split_all_function_names[cand_local_idx]}
-                # ----------------------------------------------------------
-
+                    cand_meta = {'binary_name': split_all_binary_names[cand_local_idx], 'function_name': split_all_function_names[cand_local_idx]}
                     if (anchor_meta['function_name'] == cand_meta['function_name'] and anchor_meta['binary_name'] == cand_meta['binary_name']):
                         positives_found_by_faiss.append(cand_id)
                     else:
                         negatives_found_by_faiss.append(cand_id)
                 
-                # ... (The rest of your excellent sampling logic remains unchanged) ...
-                final_positives = positives_found_by_faiss
-                if not final_positives:
+                # --- LOGIC REMAINS THE SAME, BUT THE PRE-CONDITION IS ALREADY MET ---
+                chosen_positive_id = None
+                if positives_found_by_faiss:
+                    chosen_positive_id = random.choice(positives_found_by_faiss)
+                else:
                     all_gt_for_anchor = gt_lookup_split[anchor_meta['binary_name']][anchor_meta['function_name']]
                     valid_positives = [pid for pid in all_gt_for_anchor if pid != anchor_id]
-                    if valid_positives:
-                        final_positives.append(random.choice(valid_positives))
+                    # This list is now guaranteed to not be empty because of our pre-filtering
+                    chosen_positive_id = random.choice(valid_positives)
 
-                if not final_positives: continue
-
-                num_negatives_to_take = args.top_k - len(final_positives)
+                final_positives = [chosen_positive_id]
+                num_negatives_to_take = args.top_k - 1
                 final_negatives = negatives_found_by_faiss[:num_negatives_to_take]
 
                 remaining_needed = num_negatives_to_take - len(final_negatives)
@@ -141,15 +143,14 @@ if __name__ == "__main__":
     if not final_anchor_ids:
         print("No valid pairs found across all splits.")
     else:
+        # ... (Saving logic is the same) ...
         final_ds = Dataset.from_dict({
             "unique_id": final_anchor_ids,
             "positive_ids": final_positive_ids,
             "negative_ids": final_negative_ids,
             "split": final_splits
         })
-        print(f"\nFinal dataset stats:\n{final_ds}")
         output_path = os.path.join(args.output_dir, split_path)
-        print(f"Saving combined dataset to {output_path}")
         final_ds.save_to_disk(output_path)
 
     print("\nAll splits processed successfully!")
