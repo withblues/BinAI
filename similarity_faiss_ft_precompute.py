@@ -1,5 +1,4 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import json
 import numpy as np
 import argparse
@@ -10,23 +9,33 @@ import faiss
 import random
 
 if __name__ == "__main__":
-    # ... (Arguments are the same) ...
-    parser = argparse.ArgumentParser(description="FAISS-based dataset generation for fine-tuning (1 positive vs k-1 negatives).")
+    parser = argparse.ArgumentParser(description="Hybrid FAISS dataset generation for fine-tuning with score-based hard negative mining.")
+    # --- Arguments from BOTH scripts ---
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--splits_dir", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, default="outputs/cosine_faiss_ft_1_vs_k")
-    parser.add_argument("--batch_size", type=int, default=4096)
-    parser.add_argument("--num_candidates_faiss", type=int, default=512, help="Number of candidates to initially retrieve from FAISS. A larger value finds better hard negatives.")
-    parser.add_argument("--top_k", type=int, default=10, help="The final total number of targets for each anchor.")
+    parser.add_argument("--output_dir", type=str, default="outputs/cosine_faiss_ft")
     parser.add_argument("--split", type=str, default='project')
+    parser.add_argument("--batch_size", type=int, default=4096)
+    parser.add_argument("--top_k", type=int, default=10, help="Total number of targets to generate for each anchor.")
+    parser.add_argument("--num_candidates_faiss", type=int, default=512, help="Number of candidates to retrieve from FAISS.")
+    # Quotas for negative sampling
+    parser.add_argument("--num_hard_negatives", type=int, default=5, help="Number of negatives to sample from the mid-similarity pool.")
+    parser.add_argument("--num_random_negatives", type=int, default=4, help="Number of negatives to sample randomly or from the low-similarity pool.")
+    # Score thresholds
+    parser.add_argument("--hard_positive_threshold", type=float, default=0.7, help="Min score for a candidate to be a 'hard positive'.")
+    parser.add_argument("--hard_negative_max_score", type=float, default=0.7, help="Max score for a candidate to be a 'hard negative'.")
+    parser.add_argument("--hard_negative_min_score", type=float, default=0.2, help="Min score for a candidate to be a 'hard negative'.")
     args = parser.parse_args()
+
+    # We need exactly 1 positive, so the sum of negatives must be top_k - 1
+    assert (args.num_hard_negatives + args.num_random_negatives == args.top_k - 1), "The sum of negative counts must equal top_k - 1."
+
     split_path = f'cross_{args.split}_split'
     random.seed(42)
     np.random.seed(42)
     os.makedirs(args.output_dir, exist_ok=True)
-    assert args.num_candidates_faiss > args.top_k, "--num_candidates_faiss must be greater than --top_k"
-    
-    # --- Setup: Load full dataset once to create splits ---
+
+    # --- Setup: Load full dataset once ---
     print("Loading full dataset to prepare splits...")
     original_dataset = load_from_disk(args.data_dir)
     split_file_path = os.path.join(args.splits_dir, f"{split_path}.json")
@@ -34,7 +43,8 @@ if __name__ == "__main__":
         split_ids_by_group = json.load(f)
 
     # --- Master Loop: Process each split IN ISOLATION ---
-    final_anchor_ids, final_positive_ids, final_negative_ids, final_splits = [], [], [], []
+    final_anchor_ids, final_positive_ids, final_negative_ids = [], [], []
+    final_positive_scores, final_negative_scores, final_splits = [], [], []
 
     for data_split in ["train", "val"]:
         print(f"\n{'='*20} PROCESSING SPLIT: {data_split.upper()} {'='*20}")
@@ -45,7 +55,7 @@ if __name__ == "__main__":
         split_dataset = original_dataset.filter(lambda x: x['unique_id'] in split_ids_set, num_proc=32)
         if len(split_dataset) == 0: continue
         
-        # ... (Bulk data extraction is the same and correct) ...
+        # --- Bulk data extraction ---
         split_dataset.set_format("numpy", columns=['unique_id', 'binary_name', 'function_name', 'clap_embedding'])
         split_data_np = split_dataset[:]
         split_embeddings = split_data_np['clap_embedding'].astype('float32')
@@ -54,6 +64,8 @@ if __name__ == "__main__":
         split_all_function_names = split_data_np['function_name'].tolist()
         split_num_rows, dim = split_embeddings.shape
         split_id_to_index = {uid: i for i, uid in enumerate(split_all_ids)}
+        
+        # --- Build local GT lookup ---
         gt_lookup_split = {}
         for i in tqdm(range(split_num_rows), desc=f"Building {data_split} GT lookup"):
             uid_int, b_name_str, f_name_str = int(split_all_ids[i]), str(split_all_binary_names[i]), str(split_all_function_names[i])
@@ -61,20 +73,17 @@ if __name__ == "__main__":
             if f_name_str not in gt_lookup_split[b_name_str]: gt_lookup_split[b_name_str][f_name_str] = []
             gt_lookup_split[b_name_str][f_name_str].append(uid_int)
 
-        # --- Create a list of ANCHORS THAT ARE ACTUALLY VALID ---
-        # This is a pre-filtering step to improve efficiency
+        # --- Pre-filter for valid anchors ---
         valid_anchor_indices = []
         for idx in range(split_num_rows):
              meta = {'binary_name': split_all_binary_names[idx], 'function_name': split_all_function_names[idx]}
              all_gt = gt_lookup_split[meta['binary_name']][meta['function_name']]
-             if len(all_gt) > 1: # Check if there is at least one OTHER positive
+             if len(all_gt) > 1:
                  valid_anchor_indices.append(idx)
-        
         valid_anchor_indices = np.array(valid_anchor_indices)
         print(f"Found {len(valid_anchor_indices)} valid anchors with at least one positive pair.")
 
         # --- Build FAISS index ---
-        # ... (FAISS building is the same and correct) ...
         nlist = max(1, min(4096, split_num_rows // 100))
         quantizer = faiss.IndexFlatIP(dim)
         cpu_index = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_INNER_PRODUCT)
@@ -90,67 +99,103 @@ if __name__ == "__main__":
             batch_local_indices = valid_anchor_indices[start:end]
             if len(batch_local_indices) == 0: continue
             batch_embeddings = split_embeddings[batch_local_indices]
-            
             scores, indices = gpu_index.search(batch_embeddings, args.num_candidates_faiss)
 
             for i, anchor_local_idx in enumerate(batch_local_indices):
                 anchor_id = split_all_ids[anchor_local_idx]
                 anchor_meta = {'binary_name': split_all_binary_names[anchor_local_idx], 'function_name': split_all_function_names[anchor_local_idx]}
 
-                positives_found_by_faiss, negatives_found_by_faiss = [], []
+                # --- NEW HYBRID SAMPLING LOGIC ---
+                # 1. Classify all candidates into buckets
+                hard_pos_candidates_gt = []
+                hard_neg_candidates = []
+                easy_neg_candidates = []
+                
                 for cand_local_idx, score in zip(indices[i], scores[i]):
                     if cand_local_idx == -1 or cand_local_idx == anchor_local_idx: continue
                     cand_id = split_all_ids[cand_local_idx]
                     cand_meta = {'binary_name': split_all_binary_names[cand_local_idx], 'function_name': split_all_function_names[cand_local_idx]}
-                    if (anchor_meta['function_name'] == cand_meta['function_name'] and anchor_meta['binary_name'] == cand_meta['binary_name']):
-                        positives_found_by_faiss.append(cand_id)
-                    else:
-                        negatives_found_by_faiss.append(cand_id)
-                
-                # --- LOGIC REMAINS THE SAME, BUT THE PRE-CONDITION IS ALREADY MET ---
+                    
+                    is_positive = (anchor_meta['function_name'] == cand_meta['function_name'] and anchor_meta['binary_name'] == cand_meta['binary_name'])
+
+                    if is_positive:
+                        if score >= args.hard_positive_threshold:
+                            hard_pos_candidates_gt.append(cand_id)
+                    else: # Is a negative
+                        if args.hard_negative_min_score <= score < args.hard_negative_max_score:
+                            hard_neg_candidates.append(cand_id)
+                        elif score < args.hard_negative_min_score:
+                            easy_neg_candidates.append(cand_id)
+
+                # 2. Select exactly ONE positive
                 chosen_positive_id = None
-                if positives_found_by_faiss:
-                    chosen_positive_id = random.choice(positives_found_by_faiss)
+                if hard_pos_candidates_gt:
+                    chosen_positive_id = random.choice(hard_pos_candidates_gt)
                 else:
                     all_gt_for_anchor = gt_lookup_split[anchor_meta['binary_name']][anchor_meta['function_name']]
                     valid_positives = [pid for pid in all_gt_for_anchor if pid != anchor_id]
-                    # This list is now guaranteed to not be empty because of our pre-filtering
-                    chosen_positive_id = random.choice(valid_positives)
-
+                    chosen_positive_id = random.choice(valid_positives) # Guaranteed to not be empty
+                
                 final_positives = [chosen_positive_id]
-                num_negatives_to_take = args.top_k - 1
-                final_negatives = negatives_found_by_faiss[:num_negatives_to_take]
+                
+                # 3. Sample negatives based on quotas
+                final_negatives = []
+                
+                # Sample hard negatives
+                num_hard_to_sample = min(len(hard_neg_candidates), args.num_hard_negatives)
+                if num_hard_to_sample > 0:
+                    final_negatives.extend(random.sample(hard_neg_candidates, num_hard_to_sample))
+                    
+                # Sample "easy" negatives from FAISS results first
+                num_random_to_sample = args.num_random_negatives
+                num_easy_from_faiss = min(len(easy_neg_candidates), num_random_to_sample)
+                if num_easy_from_faiss > 0:
+                    final_negatives.extend(random.sample(easy_neg_candidates, num_easy_from_faiss))
 
-                remaining_needed = num_negatives_to_take - len(final_negatives)
+                # Backfill with purely random negatives if quotas not met
+                remaining_needed = (args.top_k - 1) - len(final_negatives)
                 if remaining_needed > 0:
                     all_gt_for_anchor = gt_lookup_split[anchor_meta['binary_name']][anchor_meta['function_name']]
                     forbidden_ids = set(all_gt_for_anchor)
                     forbidden_ids.update(final_negatives)
                     
-                    while len(final_negatives) < num_negatives_to_take:
+                    while len(final_negatives) < (args.top_k - 1):
                         rand_idx = random.randint(0, split_num_rows - 1)
                         rand_id = split_all_ids[rand_idx]
                         if rand_id not in forbidden_ids:
                             final_negatives.append(rand_id)
                             forbidden_ids.add(rand_id)
                 
+                # --- Calculate scores and append ---
+                anchor_embedding = split_embeddings[anchor_local_idx]
+                pos_indices = [split_id_to_index[pid] for pid in final_positives]
+                pos_embeddings = split_embeddings[pos_indices]
+                pos_scores = (anchor_embedding @ pos_embeddings.T).tolist()
+                neg_indices = [split_id_to_index[nid] for nid in final_negatives]
+                neg_embeddings = split_embeddings[neg_indices]
+                neg_scores = (anchor_embedding @ neg_embeddings.T).tolist()
+                
                 final_anchor_ids.append(anchor_id)
                 final_positive_ids.append(final_positives)
                 final_negative_ids.append(final_negatives)
                 final_splits.append(data_split)
+                final_positive_scores.append(pos_scores)
+                final_negative_scores.append(neg_scores)
 
     # --- Step 3: Build and save the COMBINED final dataset ---
     if not final_anchor_ids:
         print("No valid pairs found across all splits.")
     else:
-        # ... (Saving logic is the same) ...
         final_ds = Dataset.from_dict({
             "unique_id": final_anchor_ids,
             "positive_ids": final_positive_ids,
             "negative_ids": final_negative_ids,
+            "positive_scores": final_positive_scores,
+            "negative_scores": final_negative_scores,
             "split": final_splits
         })
         output_path = os.path.join(args.output_dir, split_path)
+        print(f"Saving combined dataset to {output_path}")
         final_ds.save_to_disk(output_path)
 
     print("\nAll splits processed successfully!")
