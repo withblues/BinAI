@@ -194,7 +194,7 @@ if __name__ == "__main__":
                         'negative_ids': [int(n) for n in negatives]
                     })
             val_cosine_lookup = {}
-            for anchor, positive, negatives in tqdm(
+            for anchor, positives, negatives in tqdm(
                 zip(val_cosine_cols["unique_id"], val_cosine_cols["positive_ids"], val_cosine_cols["negative_ids"]),
                 total=len(val_cosine_cols["unique_id"]),
                 desc="Building FT val lookup"
