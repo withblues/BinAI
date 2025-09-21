@@ -92,7 +92,6 @@ class PrecomputeDataset(Dataset):
         instructions = self.data[key]
         return key, instructions
 
-
 class CombinedDataset(Dataset):
     def __init__(self, base_dataset, teacher_map):
         self.base_dataset = base_dataset
@@ -115,11 +114,10 @@ class CombinedDataset(Dataset):
     
     
 class CosineDataset(Dataset):
-    def __init__(self, dataset, lookup, id2idx, technique):
+    def __init__(self, dataset, lookup, id2idx):
         self.dataset = dataset
         self.lookup = lookup
         self.id2idx = id2idx
-        self.technique = technique
 
     def __len__(self):
         return len(self.dataset)

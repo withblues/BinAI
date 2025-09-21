@@ -117,7 +117,7 @@ if __name__ == "__main__":
         if technique == 'cosine':
             ### model
             model = StudentWithCosine(student_model)
-            dataset_name = f'cosine_{sampling}'
+            dataset_name = f'cosine_{sampling}_kd'
 
         elif technique == 'ft':
             ### dataset
