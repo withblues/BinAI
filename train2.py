@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 from datasets import load_from_disk
 import argparse
 import json
@@ -16,7 +16,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--split", default='project')
-    parser.add_argument("--method", default='mse_distil')
+    parser.add_argument("--method", default='distil_mse')
 
     args = parser.parse_args()
     print(f'training on split {args.split} and method {args.method}')
@@ -91,7 +91,7 @@ if __name__ == "__main__":
 
         custom_collate = DataCollatorWithPadding(tokenizer=tokenizer, padding='longest')
         
-        if method == 'cosine_distil':
+        if method == 'distil_cosine':
             model = StudentWithProjector(
                 student_model=student_model,
                 teacher_dim=768,
@@ -187,7 +187,7 @@ if __name__ == "__main__":
                 anchor_int = int(anchor)
                 if anchor_int not in train_cosine_lookup:
                     train_cosine_lookup[anchor_int] = []
-                # Append a dictionary for this specific (positive, negatives) pair
+                
                 for positive_id in positives:
                     train_cosine_lookup[anchor_int].append({
                         'positive_id': int(positive_id), 
@@ -301,7 +301,7 @@ if __name__ == "__main__":
 
     torch.save(model.student.state_dict(), os.path.join(output_dir, 'student.pth'))
 
-    if method == 'mse_distil' or method == 'cosine_distil':
+    if method == 'distil_mse' or method == 'distil_cosine':
         torch.save(model.projector.state_dict(), os.path.join(output_dir, 'projector.pth'))
 
     print('training complete')
