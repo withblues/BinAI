@@ -1,6 +1,7 @@
 import GPUtil
 import threading
 import time
+import os
 
 
 class GPU:
@@ -10,6 +11,7 @@ class GPU:
         self.utilization = []
         self.monitoring = False
         self.thread = None
+        self.gpu_id = int(os.environ.get("CUDA_VISIBLE_DEVICES", 0))
 
     def start_measure(self):
         self.monitoring = True
@@ -20,8 +22,9 @@ class GPU:
                 try:
                     gpus = GPUtil.getGPUs()
                     if gpus:
-                        self.memory_usage.append(gpus[0].memoryUsed)
-                        self.utilization.append(gpus[0].load)
+                        gpu = gpus[self.gpu_id]
+                        self.memory_usage.append(gpu.memoryUsed)
+                        self.utilization.append(gpu.load)
                 except Exception as e:
                     print(f"Error while measuring GPU: {e}")
                     break
