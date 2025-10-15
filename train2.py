@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 from datasets import load_from_disk
 import argparse
 import json
@@ -11,12 +11,21 @@ from tqdm import tqdm
 from src.models.dataset import CosineDataset, InfoNCEDatasetWithLookup
 import numpy as np
 
+model_dims = {
+    "clap":       768,
+    "starcoder2": 4608,
+    "deepseek":   4096,
+    "qwen":       3584,
+    "codellama":  "/home/wang/Data/llms/CodeLlama-7b-hf",
+}
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train BERT on specific objective")
     parser.add_argument("--data_dir", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--split", default='project')
     parser.add_argument("--method", default='distil_mse')
+    parser.add_argument("--teacher_type", default='clap')
 
     args = parser.parse_args()
     print(f'training on split {args.split} and method {args.method}')
@@ -25,15 +34,16 @@ if __name__ == "__main__":
     # dirs
     data_dir = args.data_dir
     output_dir = args.output_dir
+    teacher_type = args.teacher_type
 
     # handle caching map
-    cache_dir = os.path.join(args.data_dir, ".cache")
+    cache_dir = os.path.join(args.data_dir, ".cache", teacher_type)
     os.makedirs(cache_dir, exist_ok=True)
     train_cache_filter_path = os.path.join(cache_dir, 'dataset_filter', f"{args.split}_train.arrow")
     val_cache_filter_path = os.path.join(cache_dir, 'dataset_filter', f"{args.split}_val.arrow")
 
     ### load dataset
-    dataset = load_from_disk(os.path.join(data_dir, 'assembly_x64'))
+    dataset = load_from_disk(os.path.join(data_dir, f'assembly_x64_1024_{teacher_type}'))
     with open(os.path.join(data_dir, f"cross_{args.split}_split.json")) as f:
         indices = json.load(f)
 
@@ -69,7 +79,7 @@ if __name__ == "__main__":
             "unique_id": examples["unique_id"],
             "input_ids": tokenized["input_ids"],
             "attention_mask": tokenized["attention_mask"],
-            "labels": examples["clap_embedding"],
+            "labels": examples[f"{teacher_type}_embedding"],
             "function_names": examples['function_name'],
             'binary_name': examples['binary_name'],
         }
@@ -79,8 +89,8 @@ if __name__ == "__main__":
     
     train_cache_tokenization_path = os.path.join(cache_dir, 'tokenization', f"{args.split}_train.arrow")
     val_cache_tokenization_path = os.path.join(cache_dir, 'tokenization', f"{args.split}_val.arrow")
-    train_dataset = train_dataset.map(format_and_tokenize, batched=True, num_proc=os.cpu_count(), remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=train_cache_tokenization_path)
-    val_dataset = val_dataset.map(format_and_tokenize, batched=True, num_proc=os.cpu_count(), remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=val_cache_tokenization_path)
+    train_dataset = train_dataset.map(format_and_tokenize, batched=True, num_proc=os.cpu_count() // 2, remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=train_cache_tokenization_path)
+    val_dataset = val_dataset.map(format_and_tokenize, batched=True, num_proc=os.cpu_count() // 2, remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=val_cache_tokenization_path)
 
     ### model
     student_model = BertForMaskedLM.from_pretrained(os.path.join(data_dir, f'bert_mlm_{args.split}', 'best_model'))
@@ -89,18 +99,45 @@ if __name__ == "__main__":
         train_dataset = train_dataset.remove_columns(["function_names", "binary_name", "unique_id"])
         val_dataset = val_dataset.remove_columns(["function_names", "binary_name", "unique_id"])
 
-        custom_collate = DataCollatorWithPadding(tokenizer=tokenizer, padding='longest')
+
+        #custom_collate = DataCollatorWithPadding(tokenizer=tokenizer, padding='longest')
+        def custom_collate(batch):
+            # Standard padding for input_ids / attention_mask
+            input_ids = [item['input_ids'] for item in batch]
+            attention_mask = [item['attention_mask'] for item in batch]
+
+            input_ids = torch.nn.utils.rnn.pad_sequence(
+                [torch.tensor(ids) for ids in input_ids],
+                batch_first=True,
+                padding_value=tokenizer.pad_token_id
+            )
+            attention_mask = torch.nn.utils.rnn.pad_sequence(
+                [torch.tensor(mask) for mask in attention_mask],
+                batch_first=True,
+                padding_value=0
+            )
+
+            # Teacher embeddings: stack safely
+            labels = torch.stack([torch.tensor(item['labels'], dtype=torch.float32) for item in batch])
+            labels = torch.nan_to_num(labels, nan=0.0, posinf=0.0, neginf=0.0)
+            labels = torch.nn.functional.normalize(labels, p=2, dim=-1)
+
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels
+            }
         
         if method == 'distil_cosine':
             model = StudentWithProjector(
                 student_model=student_model,
-                teacher_dim=768,
+                teacher_dim=model_dims[teacher_type],
                 loss_fn='cosine'
             )
         else:
             model = StudentWithProjector(
                 student_model=student_model,
-                teacher_dim=768,
+                teacher_dim=model_dims[teacher_type],
                 loss_fn='mse'
             )
     
@@ -249,12 +286,12 @@ if __name__ == "__main__":
     # training
     #logging
     wandb.init(
-        project=f"bert_{method}",
+        project=f"bert_{teacher_type}_{method}",
         name=args.split
     )
 
     # output dir
-    output_dir = os.path.join(output_dir, f"bert_{args.split}", method)
+    output_dir = os.path.join(output_dir, f"bert_{args.split}", teacher_type ,method)
     os.makedirs(output_dir, exist_ok=True)
 
     # training args
