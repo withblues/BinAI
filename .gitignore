@@ -201,3 +201,4 @@ baseline-results-L1.csv
 *.out
 slurm
 wandb
+*.sh
