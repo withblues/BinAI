@@ -202,3 +202,4 @@ baseline-results-L1.csv
 slurm
 wandb
 *.sh
+*.ipynb
