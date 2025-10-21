@@ -1,6 +1,8 @@
 # Copyright (c) 2025 Yunru Wang
 # Based on code by Samuel Valenzuela <Samuel.valenzuela@ifi.lmu.de>; modified by Yunru Wang.
 # This file contains modifications and extensions to the original work.
+import csv
+from pathlib import Path
 import argparse
 import collections
 import functools
@@ -57,14 +59,14 @@ class PfastreXML:
 
     @staticmethod
     def train_pfastrexml(pfast_model_path, data_dir, trn_X_fname, trn_Y_fname, a=1.0, b=1.0, c=1.0,
-                         max_inst_in_leaves=10, l=100, g=30, T=64,
-                         trees=256):
+            max_inst_in_leaves=10, l=100, g=30, T=32,
+            trees=256):
         """
             Runs PfatsreXML training and test commands with the given hyperparameters
             Sample Usage :
                 ./PfastreXML_train [feature file name] [label file name] [inverse propensity file name] [model folder name] -S 0 -T 1 -s 0 -t 50 -b 1.0 -c 1.0 -m 10 -l 100
                 -g 30 -a 0.8 -q 1
-    
+
                 -S PfastXML switch, setting this to 1 omits tail classifiers, thus leading to PfastXML algorithm. default=0
                 -T Number of threads to use. default=1
                 -s Starting tree index. default=0
@@ -80,10 +82,10 @@ class PfastreXML:
         """
         print('Running new PfastreXML instance under data directory: ', data_dir)
         trn_cmd = pfast_model_path + ' {}/{} {}/{} {}/inv_prop.txt {}/xml_model '.format(data_dir, trn_X_fname,
-                                                                                         data_dir, trn_Y_fname,
-                                                                                         data_dir, data_dir)
+                data_dir, trn_Y_fname,
+                data_dir, data_dir)
         trn_cmd += '-q 0 -S 0 -T {} -t {} -a {} -b {} -c {} -m {} -g {} -l {}'.format(T, trees, a, b, c,
-                                                                                      max_inst_in_leaves, g, l)
+                max_inst_in_leaves, g, l)
         model_dir = '{}/xml_model'.format(data_dir)
         if os.path.exists(model_dir):
             # Empty directory contents
@@ -100,7 +102,7 @@ class PfastreXML:
     @staticmethod
     def pred_pfastrexml(pfast_model_path, data_dir, tst_X_fname):
         tst_cmd = pfast_model_path + ' {}/{} {}/xml_score.mat {}/xml_model'.format(data_dir, tst_X_fname, data_dir,
-                                                                                   data_dir)
+                data_dir)
         print('Running: ', tst_cmd)
         res = subprocess.call(shlex.split(tst_cmd), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if res < 0:
@@ -131,10 +133,10 @@ class PfastreXML:
         # XFL defined a subset of 'freebies' to simulate a real-life scenario in which some functions could be resolved
         # by pattern matching
         self.calculable_knowns = {'init', 'fini', 'csu_init', 'csu_fini', 'start', 'libc_csu_init', 'libc_csu_fini',
-                                  'libc_start', 'deregister_tm_clones', 'register_tm_clones', 'rtld_init', 'main',
-                                  'do_global_dtors_aux', 'frame_dummy', 'frame_dummy_init_array_entry',
-                                  'do_global_dtors_aux_fini_array_entry', 'init_array_end', 'init_array_start',
-                                  'start_main', 'libc_start_main'}
+                'libc_start', 'deregister_tm_clones', 'register_tm_clones', 'rtld_init', 'main',
+                'do_global_dtors_aux', 'frame_dummy', 'frame_dummy_init_array_entry',
+                'do_global_dtors_aux_fini_array_entry', 'init_array_end', 'init_array_start',
+                'start_main', 'libc_start_main'}
 
     def from_data(self, df, k):
         print('Generating label space for top {} labels...'.format(k))
@@ -150,7 +152,7 @@ class PfastreXML:
 
         # save pandas dataframes
         for k in tqdm.tqdm(['{}_{}'.format(b, e) for b in ('trn', 'val', 'tst') for e in ('X', 'Y')] + ['name_df'],
-                           desc='Saving model data'):
+                desc='Saving model data'):
             value = getattr(self, k)
             value.to_pickle('{}/{}.pickle'.format(self.directory, k))
 
@@ -177,7 +179,7 @@ class PfastreXML:
         while True:
             chunks = n_chunks(self.canonical_sets, 256)
             results = Parallel(n_jobs=self.config.analysis.THREAD_POOL_THREADS, verbose=1, backend='multiprocessing')(
-                map(delayed(PfastreXML.name_vector), chunks, itertools.repeat(self.label_space)))
+                    map(delayed(PfastreXML.name_vector), chunks, itertools.repeat(self.label_space)))
             labels = functools.reduce(lambda x, y: x + y, results, [])
             labels_mat = np.vstack(labels)
 
@@ -214,7 +216,7 @@ class PfastreXML:
 
         c = collections.Counter()
         results = Parallel(n_jobs=self.config.analysis.THREAD_POOL_THREADS, verbose=1, backend='multiprocessing')(
-            map(delayed(PfastreXML.count_tokens), chunks))
+                map(delayed(PfastreXML.count_tokens), chunks))
         self.canonical_sets = []
         for s_canonical_set, s_counter in results:
             c += s_counter
@@ -242,7 +244,7 @@ class PfastreXML:
 
     @staticmethod
     def write_xml_txt(df, fname, shape=None):
-       with open(fname, 'w') as f:
+        with open(fname, 'w') as f:
             vshape = df.shape
             if shape:
                 vshape = shape
@@ -364,13 +366,13 @@ class PfastreXML:
         macro_avg_ml_f1 = np.mean(m_ml_f1)
 
         experiment_results = {
-            'micro_p': ml_p,
-            'micro_r': ml_r,
-            'micro_f1': ml_f1,
-            'macro_p': macro_avg_ml_p,
-            'macro_r': macro_avg_ml_r,
-            'macro_f1': macro_avg_ml_f1,
-        }
+                'micro_p': ml_p,
+                'micro_r': ml_r,
+                'micro_f1': ml_f1,
+                'macro_p': macro_avg_ml_p,
+                'macro_r': macro_avg_ml_r,
+                'macro_f1': macro_avg_ml_f1,
+                }
         return experiment_results
 
     # Arguments' index must be aligned with self.tst_Y
@@ -382,9 +384,9 @@ class PfastreXML:
             true_label_indices = list(true_Y[i].nonzero()[0])
             pred_label_indices = list(pred_Y[i].nonzero()[0])
             db_values = {
-                f'xfl_true_labels_{args.db_field_name}': '_'.join(self.label_space[j] for j in true_label_indices),
-                f'xfl_pred_labels_{args.db_field_name}': '_'.join(self.label_space[j] for j in pred_label_indices),
-            }
+                    f'xfl_true_labels_{args.db_field_name}': '_'.join(self.label_space[j] for j in true_label_indices),
+                    f'xfl_pred_labels_{args.db_field_name}': '_'.join(self.label_space[j] for j in pred_label_indices),
+                    }
             db._update_entry('bcsd_dataset_stripped', 'func_id_first', func_id, db_values)
 
     @staticmethod
@@ -448,9 +450,9 @@ class PfastreXML:
             pred_labels = tuple(map(lambda x, L=self.label_space: L[x], pred_top_n))
             corr_labels = tuple(map(lambda x, L=self.label_space: L[x], corr_top_n))
             print(
-                '{:<40} :: N={}, TL={}, PL={}, Cumulative Gain: {:>2}, Discounted Cumulative Gain: {:>7}, Normalised Discounted Cumulative Gain: {:>7}'.format(
-                    func_name, p, corr_labels, pred_labels, cg, dcg, ndcg
-                ))
+                    '{:<40} :: N={}, TL={}, PL={}, Cumulative Gain: {:>2}, Discounted Cumulative Gain: {:>7}, Normalised Discounted Cumulative Gain: {:>7}'.format(
+                        func_name, p, corr_labels, pred_labels, cg, dcg, ndcg
+                        ))
             print('\t{:<40}->{:<40}'.format(func_name, '_'.join(pred_labels)))
             cgs.append(cg)
             dcgs.append(dcg)
@@ -550,7 +552,7 @@ def load_embedding(teacher_type="clap", data_dir="/mnt/ambrym2/datasets/distil",
     ### load dataset
     dataset = load_from_disk(os.path.join(data_dir, f'assembly_x64_1024_{teacher_type}'))
     dataset = dataset.select_columns(["unique_id", "function_name",
-                                 f"{split}_embedding"])
+        f"{split}_embedding"])
     with open(os.path.join(data_dir, f"cross_{split}_split.json")) as f:
         indices = json.load(f)
 
@@ -570,7 +572,7 @@ def load_embedding(teacher_type="clap", data_dir="/mnt/ambrym2/datasets/distil",
     test_df = ds_to_df(test_dataset, split, "test", nlp)
     del test_dataset
     gc.collect()
-    
+
     df = pd.concat([train_df, val_df, test_df], copy=False)
     return df
 
@@ -583,7 +585,7 @@ def write_results_to_csv(output_file: str, eval_config: dict, metric_results: di
         if not file_exists:
             csv_writer.writeheader()
         csv_writer.writerow(csv_entry)
-    
+
 
 def main(args, temp_dir):
     print(f'{args=}')
