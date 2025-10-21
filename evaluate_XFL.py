@@ -23,8 +23,6 @@ from joblib import Parallel, delayed
 import json
 import gc
 
-from contrastive_utils import write_results_to_csv
-from ida_db import IdaDB
 from xfl.config import Config
 from xfl.evaluation import Evaluation
 from xfl.nlp import NLP
@@ -575,12 +573,22 @@ def load_embedding(teacher_type="clap", data_dir="/mnt/ambrym2/datasets/distil",
     
     df = pd.concat([train_df, val_df, test_df], copy=False)
     return df
+
+def write_results_to_csv(output_file: str, eval_config: dict, metric_results: dict):
+    file_path = Path(output_file)
+    file_exists = file_path.is_file()
+    with file_path.open('a+', newline='') as file:
+        csv_entry = eval_config | metric_results
+        csv_writer = csv.DictWriter(file, fieldnames=csv_entry.keys())
+        if not file_exists:
+            csv_writer.writeheader()
+        csv_writer.writerow(csv_entry)
     
 
 def main(args, temp_dir):
     print(f'{args=}')
     print('Loading embedding and making dataframe...')
-    df = load_embedding(teacher_type=args.teacher_type, split=args.split)
+    df = load_embedding(teacher_type=f"{args.teacher_type}", split=args.split)
     xml = PfastreXML(Config(), temp_dir)
     xml.from_data(df, args.labelspace_dims)
 
@@ -612,7 +620,7 @@ def main(args, temp_dir):
         'a': args.a,
         'g': args.g,
     }
-    write_results_to_csv(args.output_file, eval_config, ml_scores)
+    write_results_to_csv(f"{args.output_dir}/results_xfl_{args.teacher_type}-{args.split}", eval_config, ml_scores)
 
 
 if __name__ == '__main__':
@@ -626,7 +634,7 @@ if __name__ == '__main__':
     parser.add_argument('-a', '--a', default=1, type=float, help='Hyperparameter a of pfastreXML')
     parser.add_argument('-g', '--g', default=30, type=int, help='Hyperparameter g of pfastreXML')
     parser.add_argument('--db_field_name', type=str)  # will not save to database if not set
-    parser.add_argument('--output_file', type=str, default='/mnt/ambrym2/datasets/distil/results_xfl.csv')
+    parser.add_argument('--output_dir', type=str, default='/mnt/ambrym2/datasets/distil/xfl')
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory(prefix='xfl-eval-') as temp_dir:

@@ -13,7 +13,6 @@ You should have received a copy of the GNU General Public License along with XFL
 
 """
 
-import utils
 import numpy as np
 
 class Evaluation():
@@ -21,9 +20,11 @@ class Evaluation():
         Class to calculate evaluation meterics for an experiment
     """
 
+    '''
     @staticmethod
     def f1(tp, tn, fp, fn):
         return utils.calculate_f1(tp, tn, fp, fn)
+    '''
 
     def ml_precision(self, true_Y, pred_Y, MODE='MICRO') -> np.ndarray:
         """
