@@ -14,6 +14,15 @@ import numpy as np
 import torch.nn as nn
 from datasets import Features, Value, Sequence
 
+
+model_dims = {
+    "clap":       768,
+    "starcoder2": 4608,
+    "deepseek":   4096,
+    "qwen":       3584,
+    "codellama":  "/home/wang/Data/llms/CodeLlama-7b-hf",
+}
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Command line parameters")
     parser.add_argument("--data_dir", required=True)
@@ -21,18 +30,19 @@ if __name__ == "__main__":
     parser.add_argument("--split", default='project')
     parser.add_argument("--method", default='mse_distil')
     parser.add_argument("--batch_size", default=64, type=int)
+    parser.add_argument("--model", default='clap', type=str)
     args = parser.parse_args()
 
     data_dir = args.data_dir
     output_dir = args.output_dir
-    cache_dir = os.path.join(args.data_dir, ".cache")
+    cache_dir = os.path.join(args.data_dir, ".cache", args.model)
     os.makedirs(cache_dir, exist_ok=True)
     method = args.method
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"inference on {method} model split {args.split}")
 
-    dataset = load_from_disk(os.path.join(data_dir, 'assembly_x64'))
+    dataset = load_from_disk(os.path.join(data_dir, 'assembly_x64_1024_clap'))
     with open(os.path.join(data_dir, f"cross_{args.split}_split.json")) as f:
         indices = json.load(f)
 
@@ -73,7 +83,7 @@ if __name__ == "__main__":
                 
         columns_to_remove = [c for c in test_dataset.column_names if c not in ['unique_id']]
         test_cache_tokenization_path = os.path.join(cache_dir, 'tokenization', f"{args.split}_clap_test.arrow")
-        test_dataset = test_dataset.map(tokenize, batched=True, num_proc=os.cpu_count(), remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=test_cache_tokenization_path, features=output_features)
+        test_dataset = test_dataset.map(tokenize, batched=True, num_proc=32, remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=test_cache_tokenization_path, features=output_features)
 
         # model
         clap_model = AutoModel.from_pretrained(
@@ -119,7 +129,7 @@ if __name__ == "__main__":
         
         columns_to_remove = [c for c in test_dataset.column_names if c not in ['unique_id']]
         test_cache_tokenization_path = os.path.join(cache_dir, test_cache_folder, f"{args.split}_test.arrow")
-        test_dataset = test_dataset.map(format_and_tokenize, batched=True, num_proc=os.cpu_count(), remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=test_cache_tokenization_path)
+        test_dataset = test_dataset.map(format_and_tokenize, batched=True, num_proc=32, remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=test_cache_tokenization_path)
 
         ### model
         # load pretrained model
@@ -127,14 +137,14 @@ if __name__ == "__main__":
 
         if method != 'base':
             # load fine tuned model
-            weights_path = os.path.join(data_dir,f'bert_{args.split}', method, 'student.pth')
+            weights_path = os.path.join(data_dir,f'bert_{args.split}', args.model , method, 'student.pth')
             student_model.load_state_dict(torch.load(weights_path, weights_only=True, map_location=torch.device('cpu')))
             student_model = student_model.to(device)
             
 
             if 'distil' in method:
-                projector = nn.Linear(student_model.config.hidden_size, 768)
-                weights_path = os.path.join(data_dir, f'bert_{args.split}', method, 'projector.pth')
+                projector = nn.Linear(student_model.config.hidden_size, model_dims[args.model])
+                weights_path = os.path.join(data_dir, f'bert_{args.split}', args.model , method, 'projector.pth')
                 projector.load_state_dict(torch.load(weights_path, weights_only=True, map_location=torch.device('cpu')))
                 projector = projector.to(device)
                 projector.eval()
@@ -209,7 +219,7 @@ if __name__ == "__main__":
         "avg_util": gpu_monitor.get_utilization(average=True) * 100,
     }
 
-    output_dir = os.path.join(output_dir, "inference", "datasets", args.split)
+    output_dir = os.path.join(output_dir, "inference", "datasets", args.split, args.model)
     os.makedirs(output_dir, exist_ok=True)
     metadata_file_path = os.path.join(output_dir, f"{method}-metadata.json")
 
