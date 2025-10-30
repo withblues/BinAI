@@ -193,6 +193,7 @@ if __name__ == "__main__":
     parser.add_argument("--split", default='project')
     parser.add_argument("--method", required=True, help="Method name for the model (e.g., 'teacher_model')")
     parser.add_argument("--batch_size", default=1024, type=int, help="Batch size for GPU queries. Tune based on VRAM.")
+    parser.add_argument("---", default='clap', help="Model name for student-teacher evaluation.")
     args = parser.parse_args()
 
     print(f'compute metrics with {args.method} on split {args.split}')
@@ -202,7 +203,7 @@ if __name__ == "__main__":
     print(f'device {device}')
     K_VALUES = [1, 5, 10, 50, 100, 512, 1024]
 
-    source_dataset = load_from_disk(os.path.join(args.data_dir, 'inference/datasets', args.split, f'{args.method}-embeddings'))
+    source_dataset = load_from_disk(os.path.join(args.data_dir, 'inference/datasets', args.split, args.model_name, f'{args.method}-embeddings'))
     source_dataset.set_format("numpy", columns=['unique_id', 'embedding'])
     
     # load into ram
@@ -224,7 +225,7 @@ if __name__ == "__main__":
         teacher_similarity_mmap = np.memmap(teacher_matrix_path, dtype='float32', mode='r', shape=(num_rows, num_rows - 1)) 
 
     # load grount truth dataset
-    metadata_full_dataset = load_from_disk(os.path.join(args.data_dir, 'assembly_x64'))
+    metadata_full_dataset = load_from_disk(os.path.join(args.data_dir, 'assembly_x64_1024_clap'))
     metadata_dataset = metadata_full_dataset.filter(
         lambda x: x['unique_id'] in test_ids_set,
         num_proc=16 # Use multiple processes for faster filtering
@@ -358,7 +359,7 @@ if __name__ == "__main__":
             print(f"Teacher Precision@{k}: {final_report[f'precision@{k}']:.4f}")
             print(f"Teacher Recall@{k}: {final_report[f'recall@{k}']:.4f}")
 
-        report_path = os.path.join(args.output_dir, 'inference/metrics', args.split,f"{args.method}_metrics_report.json")
+        report_path = os.path.join(args.output_dir, 'inference/metrics', args.split, args.model_name, f"{args.method}_metrics_report.json")
         os.makedirs(os.path.dirname(report_path), exist_ok=True)
         with open(report_path, 'w') as f:
             json.dump(final_report, f, indent=4)
