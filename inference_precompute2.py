@@ -1,27 +1,89 @@
 import argparse
 import os
 import torch
-from transformers import AutoModel, AutoTokenizer
 import json
 import time
-from src.utils.gpu_stats import GPU
-from datasets import load_from_disk, Dataset
-from transformers import BertTokenizerFast, BertForMaskedLM, DataCollatorWithPadding
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-import torch.nn.functional as F
 import numpy as np
 import torch.nn as nn
-from datasets import Features, Value, Sequence
+import torch.nn.functional as F
+from tqdm import tqdm
+from datasets import load_from_disk, Dataset, Features, Value, Sequence
+from torch.utils.data import DataLoader
+from transformers import AutoModel, AutoTokenizer, BertTokenizerFast, BertForMaskedLM, DataCollatorWithPadding
+from src.utils.gpu_stats import GPU
+import re
 
-
-model_dims = {
-    "clap":       768,
-    "starcoder2": 4608,
-    "deepseek":   4096,
-    "qwen":       3584,
-    "codellama":  "/home/wang/Data/llms/CodeLlama-7b-hf",
+# --- Merged Model Information from both scripts ---
+teacher_model_info = {
+    "clap":       {"path": "hustcw/clap-asm", "dim": 768},
+    "starcoder2": {"path": "/mnt/ambrym2/datasets/distil/llms/starcoder2-7b", "dim": 4608},
+    "deepseek":   {"path": "/mnt/ambrym2/datasets/distil/llms/deepseek-coder-7b-base-v1.5", "dim": 4096},
+    "qwen":       {"path": "/mnt/ambrym2/datasets/distil/llms/Qwen2.5-Coder-7B", "dim": 3584},
+    "codellama":  {"path": "/mnt/ambrym2/datasets/distil/llms/CodeLlama-7b-hf", "dim": 4096},
 }
+teacher_model_names = list(teacher_model_info.keys())
+
+
+# --- Class from the second script to handle teacher LLMs ---
+class PreTrainedModel:
+    def __init__(
+        self,
+        model_path: str,
+        device: str,
+        max_len: int = 1024,
+    ):
+        self.device = device
+        self.asm_tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=True, local_files_only=True
+        )
+        if self.asm_tokenizer.pad_token is None:
+            self.asm_tokenizer.pad_token = self.asm_tokenizer.eos_token
+            self.asm_tokenizer.pad_token_id = self.asm_tokenizer.eos_token_id
+
+        self.asm_tokenizer.model_max_length = max_len
+        dtype = torch.float16 if (device.startswith("cuda") and torch.cuda.is_available()) else torch.float32
+        self.asm_encoder = AutoModel.from_pretrained(
+            model_path, trust_remote_code=True, local_files_only=True, torch_dtype=dtype
+        ).to(device)
+        self.asm_encoder.eval()
+
+    @torch.inference_mode()
+    def forward(self, batch):
+        asm_input = self.asm_tokenizer(
+            batch, return_tensors="pt", padding=True, truncation=True,
+        ).to(self.device)
+        asm_embeddings = self.asm_encoder(**asm_input)
+        
+        # Comprehensive pooling logic from your second script
+        if isinstance(asm_embeddings, torch.Tensor):
+            if asm_embeddings.ndim == 2:
+                pooled_asm_embeddings = asm_embeddings
+            elif asm_embeddings.ndim == 3:
+                mask = asm_input["attention_mask"].unsqueeze(-1)
+                pooled_asm_embeddings = (asm_embeddings * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+            else:
+                raise ValueError(f"Unexpected tensor shape: {tuple(asm_embeddings.shape)}")
+        else:
+            if hasattr(asm_embeddings, "sentence_embedding") and asm_embeddings.sentence_embedding is not None:
+                pooled_asm_embeddings = asm_embeddings.sentence_embedding
+            elif hasattr(asm_embeddings, "pooler_output") and asm_embeddings.pooler_output is not None:
+                pooled_asm_embeddings = asm_embeddings.pooler_output
+            else:
+                last = asm_embeddings.last_hidden_state
+                mask = asm_input["attention_mask"].unsqueeze(-1)
+                pooled_asm_embeddings = (last * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+
+        return pooled_asm_embeddings.float().cpu().numpy()
+
+def custom_collate_for_text(batch):
+    """
+    Collates a list of samples into a single batch dictionary.
+    Instead of stacking, it creates lists for each key.
+    """
+    keys = [item['keys'] for item in batch]
+    instructions = [item['instructions'] for item in batch]
+    return {'keys': keys, 'instructions': instructions}
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Command line parameters")
@@ -30,137 +92,102 @@ if __name__ == "__main__":
     parser.add_argument("--split", default='project')
     parser.add_argument("--method", default='mse_distil')
     parser.add_argument("--batch_size", default=64, type=int)
-    parser.add_argument("--model", default='clap', type=str)
+    # --- Updated model choices ---
+    parser.add_argument("--model", default='clap', type=str, 
+                        help="Can be a teacher model or a student model config.")
+    parser.add_argument("--is_teacher", action='store_true',)
     args = parser.parse_args()
 
     data_dir = args.data_dir
     output_dir = args.output_dir
+    # Cache directory now depends on the specific model being run
     cache_dir = os.path.join(args.data_dir, ".cache", args.model)
     os.makedirs(cache_dir, exist_ok=True)
     method = args.method
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    print(f"inference on {method} model split {args.split}")
+    print(f"Inference on {args.model} model using method '{method}' on split '{args.split}'")
 
     dataset = load_from_disk(os.path.join(data_dir, 'assembly_x64_1024_clap'))
     with open(os.path.join(data_dir, f"cross_{args.split}_split.json")) as f:
         indices = json.load(f)
 
     test_ids = set(indices['test'])
-
     test_cache_filter_path = os.path.join(cache_dir, 'dataset_filter', f"{args.split}_test.arrow")
     test_dataset = dataset.filter(lambda batch: [uid in test_ids for uid in batch["unique_id"]], batched=True, num_proc=16, cache_file_name=test_cache_filter_path)
 
-    if method == 'clap':
-        model_path = "hustcw/clap-asm"
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_path, trust_remote_code=True
-        )
+    model = None
+    tokenizer = None
+    data_collator = None
 
-        def tokenize(examples):
-            combined_inputs = [
-                {k: instr for k, instr in zip(keys, instrs)}
-                for keys, instrs in zip(examples["keys"], examples["instructions"])
-            ]
-            tokenized = tokenizer(
-                combined_inputs,
-                padding=False,
-                #return_tensors="pt",
-            )
-            return {
-                "unique_id": examples["unique_id"],
-                "input_ids": tokenized["input_ids"],
-                "attention_mask": tokenized["attention_mask"],
-                "token_type_ids": tokenized["token_type_ids"]
-            }
-        
-        output_features = Features({
-            'unique_id': Value('int64'),
-            'input_ids': Sequence(Value('int32')),
-            'attention_mask': Sequence(Value('int8')),
-            'token_type_ids': Sequence(Value('int64'))
-        })
-                
-        columns_to_remove = [c for c in test_dataset.column_names if c not in ['unique_id']]
-        test_cache_tokenization_path = os.path.join(cache_dir, 'tokenization', f"{args.split}_clap_test.arrow")
-        test_dataset = test_dataset.map(tokenize, batched=True, num_proc=32, remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=test_cache_tokenization_path, features=output_features)
+    # --- REFACTORED LOGIC: Handle TEACHER models first ---
+    if args.is_teacher:
+        print(f"Loading TEACHER model: {args.model}")
+        model_path = teacher_model_info[args.model]["path"]
+        model = PreTrainedModel(model_path, device)
+        tokenizer = model.asm_tokenizer # For reference, though not used for pre-tokenization
+        data_collator = custom_collate_for_text
 
-        # model
-        clap_model = AutoModel.from_pretrained(
-            model_path, trust_remote_code=True
-        ).to(device)
-        clap_model.eval()
+        columns_to_keep = ['unique_id', 'keys', 'instructions']
+        columns_to_remove = [c for c in test_dataset.column_names if c not in columns_to_keep]
+        test_dataset = test_dataset.remove_columns(columns_to_remove)
 
+    # --- ORIGINAL LOGIC: Handle STUDENT models ---
     else:
-        ### tokenizing
-        # load custom tokenizer
+        print(f"Loading STUDENT model for method: {method}")
+        # Tokenizing for student BERT model
         tokenizer = BertTokenizerFast.from_pretrained(os.path.join(data_dir, "tokenizer"))
+        
 
-        # handle 1024 edge case
-        if "1024" in method:
-            max_length = 1024
-            test_cache_folder = 'tokenization_1024'
+        # Extract first number from the method
+        match = re.search(r"\d+", method)
+        max_length = int(match.group()) if match else 128
+
+        # test_cache_folder logic
+        if match:
+            test_cache_folder = f"tokenization_{max_length}"
         else:
-            max_length = 128
-            test_cache_folder = 'tokenization'
+            test_cache_folder = "tokenization"
 
-        # postprocess dataset
+        print(f'Using max_length={max_length} for tokenization.')
+        print(f'Caching tokenized dataset in folder: {test_cache_folder}')
+
         def format_and_tokenize(examples):
-            sep_token = tokenizer.sep_token
-            cls_token = tokenizer.cls_token
-    
             texts = [
-                f"{cls_token} " + f" {sep_token} ".join(instr_list) + f" {sep_token}"
+                f"{tokenizer.cls_token} " + f" {tokenizer.sep_token} ".join(instr_list) + f" {tokenizer.sep_token}"
                 for instr_list in examples["instructions"]
             ]
+            return tokenizer(texts, truncation=True, max_length=max_length)
 
-            # Let tokenizer add CLS at the start and SEP at the end
-            tokenized = tokenizer(
-                texts,
-                truncation=True,
-                max_length=max_length,
-            )
-            
-            return {
-                "unique_id": examples["unique_id"],
-                "input_ids": tokenized["input_ids"],
-                "attention_mask": tokenized["attention_mask"],
-            }
-        
         columns_to_remove = [c for c in test_dataset.column_names if c not in ['unique_id']]
         test_cache_tokenization_path = os.path.join(cache_dir, test_cache_folder, f"{args.split}_test.arrow")
-        test_dataset = test_dataset.map(format_and_tokenize, batched=True, num_proc=32, remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=test_cache_tokenization_path)
+        test_dataset = test_dataset.map(format_and_tokenize, batched=True, num_proc=32, remove_columns=columns_to_remove, desc='Tokenizing data for student model...', cache_file_name=test_cache_tokenization_path)
 
-        ### model
-        # load pretrained model
-        student_model = BertForMaskedLM.from_pretrained(os.path.join(data_dir, f'bert_mlm_{args.split}', 'best_model'))
+        # Load student model and projector
+        model = BertForMaskedLM.from_pretrained(os.path.join(data_dir, f'bert_mlm_{args.split}', 'best_model'))
 
         if method != 'base':
-            # load fine tuned model
             weights_path = os.path.join(data_dir,f'bert_{args.split}', args.model , method, 'student.pth')
-            student_model.load_state_dict(torch.load(weights_path, weights_only=True, map_location=torch.device('cpu')))
-            student_model = student_model.to(device)
+            model.load_state_dict(torch.load(weights_path, weights_only=True, map_location=torch.device('cpu')))
             
-
             if 'distil' in method:
-                projector = nn.Linear(student_model.config.hidden_size, model_dims[args.model])
+                # Use teacher_model_info to get the correct dimension for the projector
+                teacher_dim = teacher_model_info[args.model]["dim"]
+                projector = nn.Linear(model.config.hidden_size, teacher_dim).to(device)
                 weights_path = os.path.join(data_dir, f'bert_{args.split}', args.model , method, 'projector.pth')
                 projector.load_state_dict(torch.load(weights_path, weights_only=True, map_location=torch.device('cpu')))
-                projector = projector.to(device)
                 projector.eval()
-
         else:
-            print('loaded base only')
-
-        student_model = student_model.to(device)
-        student_model.eval()
+            print('Loaded base student model only')
+        
+        model = model.to(device)
+        model.eval()
+        
+        data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding='longest')
 
     test_unique_ids = test_dataset['unique_id']
     test_dataset = test_dataset.remove_columns(['unique_id'])
-         
-
-    # dataloader
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding='longest')
+    
     test_dataloader = DataLoader(
         test_dataset, 
         batch_size=args.batch_size, 
@@ -169,28 +196,37 @@ if __name__ == "__main__":
         pin_memory=True
     )
 
-
     start_time = time.time()
     gpu_monitor = GPU(interval=0.1)
     gpu_monitor.start_measure()
 
-
-    ### forward pass
     all_embeddings = []
     with torch.no_grad():
         for batch in tqdm(test_dataloader, desc="Generating embeddings"):
-            # move to gpu
-            inputs = {k: v.to(device) for k, v in batch.items()}
+            # --- UNIFIED FORWARD PASS LOGIC ---
+            if args.is_teacher:
+                # Prepare input based on model type
+                if args.model == 'clap':
+                    # The default collator batches these into lists of lists
+                    keys_batch = batch['keys']
+                    instrs_batch = batch['instructions']
+                    inputs = [
+                        {k: instr for k, instr in zip(keys, instrs)}
+                        for keys, instrs in zip(keys_batch, instrs_batch)
+                    ]
+                else: # For starcoder2, deepseek, etc.
+                    instrs_batch = batch["instructions"]
+                    inputs = ['\n'.join(i) for i in instrs_batch]
+                
+                # Forward pass returns numpy array
+                numpy_embeddings = model.forward(inputs)
+                all_embeddings.append(numpy_embeddings.tolist())
             
-            # forward pass
-            if method == 'clap':
-                normalized_embeddings = clap_model(**inputs)
-
-            else:
-                outputs = student_model.bert(**inputs)
+            else: # Student model logic
+                inputs = {k: v.to(device) for k, v in batch.items()}
+                outputs = model.bert(**inputs)
                 token_embeddings = outputs.last_hidden_state
                 
-                # mean pooling
                 attention_mask = inputs['attention_mask']
                 input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).to(token_embeddings.dtype)
                 sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
@@ -201,10 +237,8 @@ if __name__ == "__main__":
                     mean_pooled_embeddings = projector(mean_pooled_embeddings)
 
                 normalized_embeddings = F.normalize(mean_pooled_embeddings, p=2, dim=-1)
+                all_embeddings.append(normalized_embeddings.cpu().tolist())
 
-            all_embeddings.append(normalized_embeddings.cpu().tolist())
-
-    
     torch.cuda.synchronize() 
     gpu_monitor.stop_measure()
     end_time = time.time()
@@ -219,9 +253,10 @@ if __name__ == "__main__":
         "avg_util": gpu_monitor.get_utilization(average=True) * 100,
     }
 
-    output_dir = os.path.join(output_dir, "inference", "datasets", args.split, args.model)
-    os.makedirs(output_dir, exist_ok=True)
-    metadata_file_path = os.path.join(output_dir, f"{method}-metadata.json")
+    output_path_base = os.path.join(output_dir, "inference", "datasets", args.split, args.model)
+    os.makedirs(output_path_base, exist_ok=True)
+    output_filename_prefix = args.model if args.is_teacher else method
+    metadata_file_path = os.path.join(output_path_base, f"{output_filename_prefix}-metadata.json")
 
     all_runs_data = []
     if os.path.exists(metadata_file_path):
@@ -289,7 +324,8 @@ if __name__ == "__main__":
         json.dump(data_to_save, f, indent=4)
 
     # safe dataset 
-    embeddings_save_path = os.path.join(output_dir, f"{method}-embeddings")
+    embeddings_save_path = os.path.join(output_path_base, f"{method}-embeddings")
+    print(f"Saving embeddings dataset to {embeddings_save_path}...")
     if not os.path.exists(embeddings_save_path):
         print("Creating final embeddings dataset...")
 
