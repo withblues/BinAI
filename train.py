@@ -1,282 +1,344 @@
-import argparse
-import torch
 import os
-from src.models.tokenizer import AsmTokenizer
-from src.models.bert import BERT
-from src.models.projector import MLPProjector
-from torch.utils.data import DataLoader
-from torch.nn import Linear
-from functools import partial
-from torch.utils.tensorboard import SummaryWriter
 from datasets import load_from_disk
-from src.models.dataset import CombinedDataset
-from src.trainers.distill_trainer import DistillTrainer
-from src.trainers.ranking_trainer import RankingTrainer
-from src.utils.data import load_data
-from src.utils.gpu_stats import GPU
+import argparse
+import json
+from transformers import BertForMaskedLM, Trainer, TrainingArguments, BertTokenizerFast, DataCollatorWithPadding
+import wandb
+from src.models.models import StudentWithProjector, StudentWithCosine, StudentWithInfoNCE
+import torch
+from tqdm import tqdm
+from src.models.dataset import CosineDataset, InfoNCEDatasetWithLookup
+import numpy as np
 
-
-def distill_collate_fn(batch, pad_token_id):
-    seqs = [sample["student_instruction"] for sample in batch]
-    teacher_embeddings = torch.stack([sample["teacher_embedding"] for sample in batch])
-
-    padded_inputs = torch.nn.utils.rnn.pad_sequence(
-        seqs, batch_first=True, padding_value=pad_token_id
-    )
-    attention_masks = (padded_inputs != pad_token_id).any(dim=-1).long()
-
-    return {
-        "student_instruction": padded_inputs,
-        "student_attention_mask": attention_masks,
-        "teacher_embedding": teacher_embeddings,
-    }
-
-
-def create_ranking_collate_fn(dataset_tokenized, pad_token_id):
-    def ranking_collate_fn(batch):
-        anchor_ids = [example["anchor_id"] for example in batch]
-        target_ids = [example["target_ids"] for example in batch]
-        cosine_scores = [example["cosine_scores"] for example in batch]
-
-        flat_target_ids = [tid for sublist in target_ids for tid in sublist]
-        all_ids = anchor_ids + flat_target_ids
-        unique_ids = list(set(all_ids))
-
-        id_to_inputs = {i: dataset_tokenized[i]["input_ids"] for i in unique_ids}
-        id_to_tensor = {
-            i: torch.tensor(seq, dtype=torch.long) for i, seq in id_to_inputs.items()
-        }
-
-        # Use pad_token_id for padding
-        padded = torch.nn.utils.rnn.pad_sequence(
-            list(id_to_tensor.values()), batch_first=True, padding_value=pad_token_id
-        )
-        attention_mask = (padded.abs().sum(dim=-1) != 0).long()
-
-        id_to_index = {id_: idx for idx, id_ in enumerate(id_to_tensor)}
-
-        anchor_indices = [id_to_index[i] for i in anchor_ids]
-        target_indices = [[id_to_index[tid] for tid in tlist] for tlist in target_ids]
-
-        return {
-            "input_ids": padded,
-            "attention_mask": attention_mask,
-            "anchor_indices": torch.tensor(anchor_indices),
-            "target_indices": torch.tensor(target_indices),
-            "cosine_scores": torch.tensor(cosine_scores, dtype=torch.float32),
-        }
-
-    return ranking_collate_fn
-
+model_dims = {
+    "clap":       768,
+    "starcoder2": 4608,
+    "deepseek":   4096,
+    "qwen":       3584,
+    "nova":      2048,
+    "codellama":  "/home/wang/Data/llms/CodeLlama-7b-hf",
+}
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Unified Training Script")
-    parser.add_argument(
-        "--mode",
-        type=str,
-        required=True,
-        choices=["distil", "ranking"],
-        help="Training mode: 'distil' or 'ranking'",
-    )
+    parser = argparse.ArgumentParser(description="Train BERT on specific objective")
     parser.add_argument("--data_dir", required=True)
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--seq_len", type=int, default=16)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--patience", type=int, default=5)
-    parser.add_argument("--function_pool", type=str, default="random")
+    parser.add_argument("--split", default='project')
+    parser.add_argument("--method", default='distil_mse')
+    parser.add_argument("--teacher_type", default='clap')
+    parser.add_argument("--max_len", default=1024, type=int)
 
     args = parser.parse_args()
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f'training on split {args.split} and method {args.method} and teacher {args.teacher_type} and max_len {args.max_len}')
+    method = args.method
+    # dirs
     data_dir = args.data_dir
     output_dir = args.output_dir
+    teacher_type = args.teacher_type
 
-    total_seq_len = (
-        args.seq_len * 2 + 3
-    )  # seq_len * 2 (data pairs) + [CLS] + [SEQ] + [SEQ]
+    # handle caching map
+    cache_dir = os.path.join(args.data_dir, ".cache", teacher_type, str(args.max_len))
+    os.makedirs(cache_dir, exist_ok=True)
+    train_cache_filter_path = os.path.join(cache_dir, 'dataset_filter', f"{args.split}_train.arrow")
+    val_cache_filter_path = os.path.join(cache_dir, 'dataset_filter', f"{args.split}_val.arrow")
 
-    # load tokenizer
-    tokenizer = AsmTokenizer(vocab_file=os.path.join(data_dir, f"baseline-vocab.txt"))
-    PAD_ID = tokenizer.vocab["[PAD]"]
-    print(f"Vocab size: {len(tokenizer.vocab)}")
+    ### load dataset
+    dataset = load_from_disk(os.path.join(data_dir, f'assembly_x64_1024_{teacher_type}'))
+    with open(os.path.join(data_dir, f"cross_{args.split}_split.json")) as f:
+        indices = json.load(f)
 
-    # load pretrained bert model
-    bert_model = BERT(
-        vocab_size=len(tokenizer.vocab),
-        d_model=128,
-        n_layers=2,
-        heads=1,
-        dropout=0.1,
-        device=device,
-    )
-    bert_model.load_state_dict(
-        torch.load(
-            os.path.join(data_dir, f"baseline-model"), map_location=torch.device("cpu")
+    train_ids = set(indices["train"])
+    val_ids = set(indices["val"])
+
+    train_dataset = dataset.filter(lambda batch: [uid in train_ids for uid in batch["unique_id"]], batched=True, num_proc=16, cache_file_name=train_cache_filter_path)
+    val_dataset = dataset.filter(lambda batch: [uid in val_ids for uid in batch["unique_id"]], batched=True, num_proc=16, cache_file_name=val_cache_filter_path)
+
+
+    ### tokenizing
+    # load custom tokenizer
+    tokenizer = BertTokenizerFast.from_pretrained(os.path.join(data_dir, "tokenizer"))
+
+    # postprocess dataset
+    def format_and_tokenize(examples):
+        sep_token = tokenizer.sep_token
+        cls_token = tokenizer.cls_token
+ 
+        texts = [
+            f"{cls_token} " + f" {sep_token} ".join(instr_list) + f" {sep_token}"
+            for instr_list in examples["instructions"]
+        ]
+
+        # Let tokenizer add CLS at the start and SEP at the end
+        tokenized = tokenizer(
+            texts,
+            truncation=True,
+            max_length=args.max_len,
         )
-    )
+        
+        return {
+            "unique_id": examples["unique_id"],
+            "input_ids": tokenized["input_ids"],
+            "attention_mask": tokenized["attention_mask"],
+            "labels": examples[f"{teacher_type}_embedding"],
+            "function_names": examples['function_name'],
+            'binary_name': examples['binary_name'],
+        }
+        
+    # keep clap embedding for now
+    columns_to_remove = [c for c in train_dataset.column_names if c not in ['unique_id']]
+    
+    train_cache_tokenization_path = os.path.join(cache_dir, 'tokenization', f"{args.split}_train.arrow")
+    val_cache_tokenization_path = os.path.join(cache_dir, 'tokenization', f"{args.split}_val.arrow")
+    train_dataset = train_dataset.map(format_and_tokenize, batched=True, num_proc=os.cpu_count() // 2, remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=train_cache_tokenization_path)
+    val_dataset = val_dataset.map(format_and_tokenize, batched=True, num_proc=os.cpu_count() // 2, remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=val_cache_tokenization_path)
 
-    train_dataloader = None
-    valid_dataloader = None
-    trainer = None
-    log_dir = ""
-    model_save_path = ""
-    projector_save_path = ""
+    ### model
+    student_model = BertForMaskedLM.from_pretrained(os.path.join(data_dir, f'bert_mlm_{args.split}', 'best_model'))
 
-    if args.mode == "distil":
-        print("setting up for Distillation Training...")
+    if 'distil' in method:
+        train_dataset = train_dataset.remove_columns(["function_names", "binary_name", "unique_id"])
+        val_dataset = val_dataset.remove_columns(["function_names", "binary_name", "unique_id"])
 
-        # load teacher embeddings
-        train_teacher_data = load_data(
-            os.path.join(data_dir, "clap/datasets", "train-embeddings.pkl")
-        )
-        valid_teacher_data = load_data(
-            os.path.join(data_dir, "clap/datasets", "valid-embeddings.pkl")
-        )
 
-        # load tokenized datasets
-        train_dataset_raw = load_from_disk(
-            os.path.join(data_dir, "distil/datasets", "train-tokenized")
-        )
-        valid_dataset_raw = load_from_disk(
-            os.path.join(data_dir, "distil/datasets", "valid-tokenized")
-        )
+        #custom_collate = DataCollatorWithPadding(tokenizer=tokenizer, padding='longest')
+        def custom_collate(batch):
+            # Standard padding for input_ids / attention_mask
+            input_ids = [item['input_ids'] for item in batch]
+            attention_mask = [item['attention_mask'] for item in batch]
 
-        # create combined datasets
-        train_dataset_combined = CombinedDataset(train_dataset_raw, train_teacher_data)
-        valid_dataset_combined = CombinedDataset(valid_dataset_raw, valid_teacher_data)
-
-        collate_func = partial(distill_collate_fn, pad_token_id=PAD_ID)
-        train_dataloader = DataLoader(
-            train_dataset_combined,
-            batch_size=args.batch_size,
-            collate_fn=collate_func,
-            shuffle=True,
-        )
-        valid_dataloader = DataLoader(
-            valid_dataset_combined,
-            batch_size=args.batch_size,
-            collate_fn=collate_func,
-            shuffle=False,
-        )
-
-        # create projector
-        teacher_d_size = train_teacher_data[0].shape[0]
-        projector = MLPProjector(128, teacher_d_size)
-
-        log_dir = f"{output_dir}/distil/{args.mode}-logs"
-        model_path = os.path.join(output_dir, "distil/models")
-        os.makedirs(model_path, exist_ok=True)
-        model_save_path = os.path.join(model_path, f"embedding-bert-model.pt")
-        projector_save_path = os.path.join(model_path, f"embedding-projector-layer.pt")
-
-        trainer = DistillTrainer(
-            bert_model=bert_model,
-            projector=projector,
-            train_dataloader=train_dataloader,
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
-            total_seq_len=total_seq_len,
-            valid_dataloader=valid_dataloader,
-            num_epochs=args.epochs,
-            patience=args.patience,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            model_save_path=model_save_path,
-            projector_save_path=projector_save_path,
-            device=device,
-            writer=SummaryWriter(log_dir=log_dir),
-        )
-
-    elif args.mode == "ranking":
-        print(
-            f"setting up for Ranking Training with dataset fnction-pool-{args.function_pool}..."
-        )
-
-        # load datasets
-        train_dataset_anchor = load_from_disk(
-            os.path.join(
-                data_dir, "clap/datasets", f"train-function-pool-{args.function_pool}"
+            input_ids = torch.nn.utils.rnn.pad_sequence(
+                [torch.tensor(ids) for ids in input_ids],
+                batch_first=True,
+                padding_value=tokenizer.pad_token_id
             )
-        )
-        train_dataset_tokenized = load_from_disk(
-            os.path.join(data_dir, "distil/datasets", "train-tokenized")
-        )
-        valid_dataset_anchor = load_from_disk(
-            os.path.join(
-                data_dir, "clap/datasets", f"valid-function-pool-{args.function_pool}"
+            attention_mask = torch.nn.utils.rnn.pad_sequence(
+                [torch.tensor(mask) for mask in attention_mask],
+                batch_first=True,
+                padding_value=0
             )
-        )
-        valid_dataset_tokenized = load_from_disk(
-            os.path.join(data_dir, "distil/datasets", "valid-tokenized")
-        )
 
-        # create collate function for ranking mode
-        collate_func_train = create_ranking_collate_fn(train_dataset_tokenized, PAD_ID)
-        collate_func_valid = create_ranking_collate_fn(valid_dataset_tokenized, PAD_ID)
+            # Teacher embeddings: stack safely
+            labels = torch.stack([torch.tensor(item['labels'], dtype=torch.float32) for item in batch])
+            labels = torch.nan_to_num(labels, nan=0.0, posinf=0.0, neginf=0.0)
+            labels = torch.nn.functional.normalize(labels, p=2, dim=-1)
 
-        train_dataloader = DataLoader(
-            train_dataset_anchor,
-            batch_size=args.batch_size,
-            collate_fn=collate_func_train,
-            shuffle=True,
-            num_workers=4,
-        )
-        valid_dataloader = DataLoader(
-            valid_dataset_anchor,
-            batch_size=args.batch_size,
-            collate_fn=collate_func_valid,
-            shuffle=False,
-            num_workers=4,
-        )
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels
+            }
+        
+        if method == 'distil_cosine':
+            model = StudentWithProjector(
+                student_model=student_model,
+                teacher_dim=model_dims[teacher_type],
+                loss_fn='cosine'
+            )
+        else:
+            model = StudentWithProjector(
+                student_model=student_model,
+                teacher_dim=model_dims[teacher_type],
+                loss_fn='mse'
+            )
+    
+    elif 'cosine' in method or 'ft' in method:
+        split = method.split('_')
+        sampling = split[-1]
+        technique = split[0]
 
-        log_dir = f"{output_dir}/distil/ranking-{args.function_pool}-logs"
-        model_path = os.path.join(output_dir, "distil/models")
-        os.makedirs(model_path, exist_ok=True)
-        model_save_path = os.path.join(
-            model_path, f"ranking-{args.function_pool}-bert-model.pt"
-        )
+        # drop unecessary columns
+        train_dataset = train_dataset.remove_columns(["labels", 'function_names', 'binary_name'])
+        val_dataset = val_dataset.remove_columns(["labels", 'function_names', 'binary_name'])
+        
+        
+        if technique == 'cosine':
+            ### model
+            model = StudentWithCosine(student_model)
+            dataset_name = f'cosine_{sampling}_kd'
 
-        trainer = RankingTrainer(
-            bert_model=bert_model,
-            train_dataloader=train_dataloader,
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
-            total_seq_len=total_seq_len,
-            valid_dataloader=valid_dataloader,
-            num_epochs=args.epochs,
-            patience=args.patience,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            model_save_path=model_save_path,
-            device=device,
-            writer=SummaryWriter(log_dir=log_dir),
-        )
-    else:
-        parser.error("Invalid mode selected. Choose 'distillation' or 'ranking'.")
+        elif technique == 'ft':
+            ### dataset
+            model = StudentWithInfoNCE(student_model, 10)
+            dataset_name = f'cosine_{sampling}_{technique}'
+
+        # load cosine dataset
+        dataset = load_from_disk(os.path.join(data_dir, f'{dataset_name}', f'cross_{args.split}_split'))
+ 
+        # split data
+        train_cache_cosine_path = os.path.join(cache_dir, f'{dataset_name}_filter', f"{args.split}_train.arrow")
+        val_cache_cosine_path = os.path.join(cache_dir, f'{dataset_name}_filter', f"{args.split}_val.arrow")
+        train_cosine_dataset = dataset.filter(lambda batch: [uid in train_ids for uid in batch["unique_id"]], batched=True, num_proc=32, cache_file_name=train_cache_cosine_path, desc='filter dataset with keys')
+        val_cosine_dataset = dataset.filter(lambda batch: [uid in val_ids for uid in batch["unique_id"]], batched=True, num_proc=32, cache_file_name=val_cache_cosine_path, desc='filter dataset with keys')
+
+        if technique == 'cosine':
+            ### build lookup table
+            # load cosine dataset into ram
+            train_cosine_dataset.set_format("numpy", columns=["unique_id", "target_ids", "cosine_scores"])
+            val_cosine_dataset.set_format("numpy", columns=["unique_id", "target_ids", "cosine_scores"])
+
+            train_cosine_cols = train_cosine_dataset[:]
+            val_cosine_cols = val_cosine_dataset[:]
+
+            train_cosine_lookup = {
+                    int(uid): ([int(tid) for tid in targets], scores)
+                    for uid, targets, scores in tqdm(
+                        zip(train_cosine_cols["unique_id"], train_cosine_cols["target_ids"], train_cosine_cols["cosine_scores"]),
+                        total=len(train_cosine_cols["unique_id"]),
+                        desc="Building train lookup"
+                    )
+                }
+            
+            val_cosine_lookup = {
+                    int(uid): ([int(tid) for tid in targets], scores)
+                    for uid, targets, scores in tqdm(
+                        zip(val_cosine_cols["unique_id"], val_cosine_cols["target_ids"], val_cosine_cols["cosine_scores"]),
+                        total=len(val_cosine_cols["unique_id"]),
+                        desc="Building val lookup"
+                    )
+                }
+            
+            ### build lookup table
+            final_train_uids = train_dataset["unique_id"]
+            final_val_uids = val_dataset["unique_id"]
+
+            train_id2idx = {uid: i for i, uid in tqdm(enumerate(final_train_uids), total=len(final_train_uids), desc="Building train id2idx")}
+            val_id2idx = {uid: i for i, uid in tqdm(enumerate(final_val_uids), total=len(final_val_uids), desc="Building val id2idx")}
+
+            train_dataset = CosineDataset(train_dataset, train_cosine_lookup, train_id2idx)
+            val_dataset = CosineDataset(val_dataset, val_cosine_lookup, val_id2idx)
+
+        elif technique == 'ft':
+            train_cosine_dataset.set_format("numpy", columns=["unique_id", "positive_ids", "negative_ids"])
+            val_cosine_dataset.set_format("numpy", columns=["unique_id", "positive_ids", "negative_ids"])
+
+            # load into RAM
+            train_cosine_cols = train_cosine_dataset[:]
+            val_cosine_cols = val_cosine_dataset[:]
+
+            train_cosine_lookup = {}
+            for anchor, positives, negatives in tqdm(
+                zip(train_cosine_cols["unique_id"], train_cosine_cols["positive_ids"], train_cosine_cols["negative_ids"]),
+                total=len(train_cosine_cols["unique_id"]),
+                desc="Building FT train lookup"
+            ):
+                anchor_int = int(anchor)
+                if anchor_int not in train_cosine_lookup:
+                    train_cosine_lookup[anchor_int] = []
+                
+                for positive_id in positives:
+                    train_cosine_lookup[anchor_int].append({
+                        'positive_id': int(positive_id), 
+                        'negative_ids': [int(n) for n in negatives]
+                    })
+            val_cosine_lookup = {}
+            for anchor, positives, negatives in tqdm(
+                zip(val_cosine_cols["unique_id"], val_cosine_cols["positive_ids"], val_cosine_cols["negative_ids"]),
+                total=len(val_cosine_cols["unique_id"]),
+                desc="Building FT val lookup"
+            ):
+                anchor_int = int(anchor)
+                if anchor_int not in val_cosine_lookup:
+                    val_cosine_lookup[anchor_int] = []
+
+                for positive_id in positives:
+                    val_cosine_lookup[anchor_int].append({
+                        'positive_id': int(positive_id), 
+                        'negative_ids': [int(n) for n in negatives]
+                    })
+
+            ### build lookup table
+            final_train_uids = train_dataset["unique_id"]
+            final_val_uids = val_dataset["unique_id"]
+
+            train_id2idx = {uid: i for i, uid in tqdm(enumerate(final_train_uids), total=len(final_train_uids), desc="Building train id2idx")}
+            val_id2idx = {uid: i for i, uid in tqdm(enumerate(final_val_uids), total=len(final_val_uids), desc="Building val id2idx")}
+
+            train_dataset = InfoNCEDatasetWithLookup(train_dataset, train_cosine_lookup, train_id2idx, top_k=10)
+            val_dataset = InfoNCEDatasetWithLookup(val_dataset, val_cosine_lookup, val_id2idx, top_k=10)
+
+
+        def custom_collate(features):
+            all_input_ids = []
+            all_attention_masks = []
+            all_labels = []
+
+            # Loop through each example in the batch
+            for feature in features:
+                all_input_ids.extend(feature['input_ids'])
+                all_attention_masks.extend(feature['attention_mask'])
+                all_labels.append(feature['labels'])
+
+            # padding
+            padded_batch = tokenizer.pad(
+                {"input_ids": all_input_ids, "attention_mask": all_attention_masks},
+                padding='longest',
+                return_tensors='pt',
+            )
+
+            labels_np = np.array(all_labels)
+            batch_labels = torch.from_numpy(labels_np).float()
+            padded_batch['labels'] = batch_labels
+
+            return padded_batch
+        
+
+
+    # training
+    #logging
+    wandb.init(
+        project=f"bert_{teacher_type}_{method}",
+        name=args.split
+    )
+
+    # output dir
+    output_dir = os.path.join(output_dir, f"bert_{args.split}", teacher_type, f'{method}_{args.max_len}')
+    os.makedirs(output_dir, exist_ok=True)
+
+    # training args
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        overwrite_output_dir=True,
+        save_strategy="steps",
+        save_steps=0.20,
+        eval_strategy='steps',
+        eval_steps=0.20,
+        per_device_train_batch_size=128,
+        per_device_eval_batch_size=128,
+        gradient_accumulation_steps=1,
+        num_train_epochs=6,
+        logging_steps=1,
+        learning_rate=1e-5,
+        weight_decay=0.01,
+        warmup_ratio=0.1,
+        tf32=True,
+        report_to='wandb',
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        remove_unused_columns=False,
+        save_safetensors=False,
+        dataloader_num_workers=8,
+        dataloader_pin_memory=True,
+        dataloader_prefetch_factor=2,
+        torch_compile=True,
+    )
+
+    # Trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        tokenizer=tokenizer,
+        data_collator=custom_collate,
+    )
 
     # start training
-    print(f"Starting training in {args.mode} mode...")
-
-    # meassure gpu
-    gpu_monitor = GPU(interval=1.0)
-    gpu_monitor.start_measure()
     trainer.train()
 
-    # show gpu statistics
-    gpu_monitor.stop_measure()
-    print("\n--- GPU Usage Summary ---")
-    if gpu_monitor.memory_usage:
-        print(f"Peak Memory Usage: {gpu_monitor.get_memory_usage(peak=True):.2f} MB")
-        print(
-            f"Average Memory Usage: {gpu_monitor.get_memory_usage(average=True):.2f} MB"
-        )
-    if gpu_monitor.utilization:
-        print(f"Peak Utilization: {gpu_monitor.get_utilization(peak=True) * 100:.2f}%")
-        print(
-            f"Average Utilization: {gpu_monitor.get_utilization(average=True) * 100:.2f}%"
-        )
-    print("-------------------------")
+    torch.save(model.student.state_dict(), os.path.join(output_dir, 'student.pth'))
 
-    print("training finished.")
+    if method == 'distil_mse' or method == 'distil_cosine':
+        torch.save(model.projector.state_dict(), os.path.join(output_dir, 'projector.pth'))
+
+    print('training complete')
