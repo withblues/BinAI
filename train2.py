@@ -1,5 +1,4 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 from datasets import load_from_disk
 import argparse
 import json
@@ -16,6 +15,7 @@ model_dims = {
     "starcoder2": 4608,
     "deepseek":   4096,
     "qwen":       3584,
+    "nova":      2048,
     "codellama":  "/home/wang/Data/llms/CodeLlama-7b-hf",
 }
 
@@ -26,18 +26,18 @@ if __name__ == "__main__":
     parser.add_argument("--split", default='project')
     parser.add_argument("--method", default='distil_mse')
     parser.add_argument("--teacher_type", default='clap')
+    parser.add_argument("--max_len", default=1024, type=int)
 
     args = parser.parse_args()
-    print(f'training on split {args.split} and method {args.method}')
+    print(f'training on split {args.split} and method {args.method} and teacher {args.teacher_type} and max_len {args.max_len}')
     method = args.method
-
     # dirs
     data_dir = args.data_dir
     output_dir = args.output_dir
     teacher_type = args.teacher_type
 
     # handle caching map
-    cache_dir = os.path.join(args.data_dir, ".cache", teacher_type)
+    cache_dir = os.path.join(args.data_dir, ".cache", teacher_type, str(args.max_len))
     os.makedirs(cache_dir, exist_ok=True)
     train_cache_filter_path = os.path.join(cache_dir, 'dataset_filter', f"{args.split}_train.arrow")
     val_cache_filter_path = os.path.join(cache_dir, 'dataset_filter', f"{args.split}_val.arrow")
@@ -72,7 +72,7 @@ if __name__ == "__main__":
         tokenized = tokenizer(
             texts,
             truncation=True,
-            max_length=128,
+            max_length=args.max_len,
         )
         
         return {
@@ -291,7 +291,7 @@ if __name__ == "__main__":
     )
 
     # output dir
-    output_dir = os.path.join(output_dir, f"bert_{args.split}", teacher_type ,method)
+    output_dir = os.path.join(output_dir, f"bert_{args.split}", teacher_type, f'{method}_{args.max_len}')
     os.makedirs(output_dir, exist_ok=True)
 
     # training args
