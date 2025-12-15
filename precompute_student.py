@@ -1,7 +1,7 @@
 import argparse
 import torch
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+#os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 from datasets import load_from_disk
 from transformers import BertTokenizerFast, BertForMaskedLM
 import torch.nn as nn
@@ -65,9 +65,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Command line parameters")
     parser.add_argument("--data_dir", default="/mnt/ambrym2/datasets/distil")
     parser.add_argument("--max_len", default=1024, type=int)
-    parser.add_argument("--batch_size", default=2048, type=int)
+    parser.add_argument("--batch_size", default=4096, type=int)
     parser.add_argument("--split", default='project', type=str)
-    parser.add_argument("--model", default="clap", type=str.lower, choices=["clap", "starcoder2", "deepseek", "qwen", "codellama"])
+    parser.add_argument("--model", default="clap", type=str.lower, choices=["clap", "starcoder2", "deepseek", "qwen", "codellama", "mlm"])
     args = parser.parse_args()
 
     data_dir = args.data_dir
@@ -80,7 +80,8 @@ if __name__ == '__main__':
     else:
         # This is the FIRST run. Load raw data and filter it.
         print(f"--- Creating new dataset at: {output_path} ---")
-        raw_dataset_path = os.path.join(data_dir, f'assembly_x64_1024_{args.model}')
+        #raw_dataset_path = os.path.join(data_dir, f'assembly_x64_1024_{args.model}')
+        raw_dataset_path = os.path.join(data_dir, f'assembly_x64_1024_clap')
         raw_dataset = load_from_disk(raw_dataset_path)
         print("Filtering C++ projects...")
         processed_dataset = raw_dataset.filter(remove_cpp, num_proc=64, batched=True)
@@ -91,15 +92,22 @@ if __name__ == '__main__':
     student_model = BertForMaskedLM.from_pretrained(os.path.join(data_dir, f'bert_mlm_{args.split}', 'best_model'))
 
     # load distilled weights
-    print('loading weights')
-    weights_path = os.path.join(data_dir,f'bert_{args.split}', args.model ,'distil_cosine', 'student.pth')
-    student_model.load_state_dict(torch.load(weights_path, weights_only=True, map_location=torch.device('cpu')))
+    # print('loading weights')
+    # weights_path = os.path.join(data_dir,f'bert_{args.split}', args.model ,'distil_cosine', 'student.pth')
+    # student_model.load_state_dict(torch.load(weights_path, weights_only=True, map_location=torch.device('cpu')))
+    # student_model = student_model.to(device)
+    # student_model.eval()
+
+    # projector = nn.Linear(student_model.config.hidden_size, model_dims[args.model])
+    # weights_path = os.path.join(data_dir, f'bert_{args.split}', args.model, 'distil_cosine', 'projector.pth')
+    # projector.load_state_dict(torch.load(weights_path, weights_only=True, map_location=torch.device('cpu')))
+    # projector = projector.to(device)
+    # projector.eval()
+
+    # for MLM model
     student_model = student_model.to(device)
     student_model.eval()
-
-    projector = nn.Linear(student_model.config.hidden_size, model_dims[args.model])
-    weights_path = os.path.join(data_dir, f'bert_{args.split}', args.model, 'distil_cosine', 'projector.pth')
-    projector.load_state_dict(torch.load(weights_path, weights_only=True, map_location=torch.device('cpu')))
+    projector = nn.Identity()
     projector = projector.to(device)
     projector.eval()
 
