@@ -193,11 +193,11 @@ if __name__ == "__main__":
     parser.add_argument("--split", default='project')
     parser.add_argument("--method", required=True, help="Method name for the model (e.g., 'teacher_model')")
     parser.add_argument("--batch_size", default=1024, type=int, help="Batch size for GPU queries. Tune based on VRAM.")
-    parser.add_argument("---", default='clap', help="Model name for student-teacher evaluation.")
+    parser.add_argument("--model_name", default='clap', help="Model name for student-teacher evaluation.")
     args = parser.parse_args()
 
     print(f'compute metrics with {args.method} on split {args.split}')
-    IS_STUDENT_EVAL = args.method != 'clap'
+    IS_STUDENT_EVAL = args.method not in ['clap', 'deepseek', 'starcoder2', 'qwen' ,'llm4decompile', 'nova']
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f'device {device}')
@@ -205,10 +205,11 @@ if __name__ == "__main__":
 
     source_dataset = load_from_disk(os.path.join(args.data_dir, 'inference/datasets', args.split, args.model_name, f'{args.method}-embeddings'))
     source_dataset.set_format("numpy", columns=['unique_id', 'embedding'])
-    
+
     # load into ram
     all_data_np = source_dataset[:] 
     all_ids = all_data_np['unique_id']
+
     all_embeddings_np = np.ascontiguousarray(all_data_np['embedding'], dtype=np.float32)
     num_rows, dim = all_embeddings_np.shape
     print(f"Loaded {num_rows} embeddings of dimension {dim}.")
