@@ -7,7 +7,7 @@ import wandb
 from src.models.models import StudentWithProjector, StudentWithCosine, StudentWithInfoNCE
 import torch
 from tqdm import tqdm
-from src.models.dataset import CosineDataset, InfoNCEDatasetWithLookup
+from src.utils.dataset import CosineDataset, InfoNCEDatasetWithLookup
 import numpy as np
 
 model_dims = {
@@ -26,7 +26,9 @@ if __name__ == "__main__":
     parser.add_argument("--split", default='project')
     parser.add_argument("--method", default='distil_mse')
     parser.add_argument("--teacher_type", default='clap')
-    parser.add_argument("--max_len", default=1024, type=int)
+    parser.add_argument("--max_len", default=128, type=int)
+    parser.add_argument("--finetune_checkpoint", type=str, default=None, help="Checkpoint name to start finetuning from (e.g., 'distil_cosine_1024')")
+    parser.add_argument("--use_projector_in_ft", action='store_true', help="Use the projector from the checkpoint during finetuning.")
 
     args = parser.parse_args()
     print(f'training on split {args.split} and method {args.method} and teacher {args.teacher_type} and max_len {args.max_len}')
@@ -94,6 +96,28 @@ if __name__ == "__main__":
 
     ### model
     student_model = BertForMaskedLM.from_pretrained(os.path.join(data_dir, f'bert_mlm_{args.split}', 'best_model'))
+    projector_to_use = None 
+
+    if args.finetune_checkpoint:
+        checkpoint_dir = os.path.join(args.output_dir, f"bert_{args.split}", args.teacher_type, args.finetune_checkpoint)
+        student_weights_path = os.path.join(checkpoint_dir, 'student.pth')
+        
+        if os.path.exists(student_weights_path):
+            print(f"Loading student model from {student_weights_path}")
+            student_model.load_state_dict(torch.load(student_weights_path, map_location='cpu'))
+            
+            if args.use_projector_in_ft:
+                projector_weights_path = os.path.join(checkpoint_dir, 'projector.pth')
+                if os.path.exists(projector_weights_path):
+                    print(f"Found projector weights at {projector_weights_path}")
+                    teacher_dim = model_dims[args.teacher_type]
+                    projector = torch.nn.Linear(student_model.config.hidden_size, teacher_dim)
+                    projector.load_state_dict(torch.load(projector_weights_path, map_location='cpu'))
+                    projector_to_use = projector
+                else:
+                    print("WARNING: --use_projector_in_ft was specified, but no projector.pth found in checkpoint. Projector will not be used.")
+        else:
+            print(f"WARNING: Checkpoint not found at {checkpoint_dir}. Using default MLM model.")
 
     if 'distil' in method:
         train_dataset = train_dataset.remove_columns(["function_names", "binary_name", "unique_id"])
@@ -153,12 +177,12 @@ if __name__ == "__main__":
         
         if technique == 'cosine':
             ### model
-            model = StudentWithCosine(student_model)
+            model = StudentWithCosine(student_model, projector=projector_to_use)
             dataset_name = f'cosine_{sampling}_kd'
 
         elif technique == 'ft':
             ### dataset
-            model = StudentWithInfoNCE(student_model, 10)
+            model = StudentWithInfoNCE(student_model, 10, projector=projector_to_use)
             dataset_name = f'cosine_{sampling}_{technique}'
 
         # load cosine dataset
@@ -285,13 +309,26 @@ if __name__ == "__main__":
 
     # training
     #logging
+    project_name = f"bert_{teacher_type}_{method}"
+    run_name = args.split
+
+    finetuning_details = ""
+    if args.finetune_checkpoint:
+        finetuning_details += f"_from_{args.finetune_checkpoint}"
+        if args.use_projector_in_ft:
+            finetuning_details += "_with_proj"
+        else:
+            finetuning_details += "_no_proj"
+    run_name += finetuning_details
+
     wandb.init(
-        project=f"bert_{teacher_type}_{method}",
-        name=args.split
+        project=project_name,
+        name=run_name
     )
 
     # output dir
-    output_dir = os.path.join(output_dir, f"bert_{args.split}", teacher_type, f'{method}_{args.max_len}')
+    output_dir_name = f'{method}_{args.max_len}{finetuning_details}'
+    output_dir = os.path.join(output_dir, f"bert_{args.split}", teacher_type, output_dir_name)
     os.makedirs(output_dir, exist_ok=True)
 
     # training args
@@ -338,7 +375,7 @@ if __name__ == "__main__":
 
     torch.save(model.student.state_dict(), os.path.join(output_dir, 'student.pth'))
 
-    if method == 'distil_mse' or method == 'distil_cosine':
+    if hasattr(model, 'projector') and model.projector is not None:
         torch.save(model.projector.state_dict(), os.path.join(output_dir, 'projector.pth'))
 
     print('training complete')
