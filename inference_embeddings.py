@@ -166,16 +166,18 @@ if __name__ == "__main__":
         # Load student model and projector
         model = BertForMaskedLM.from_pretrained(os.path.join(data_dir, f'bert_mlm_{args.split}', 'best_model'))
 
+        projector = None
         if method != 'base':
             weights_path = os.path.join(data_dir,f'bert_{args.split}', args.model , method, 'student.pth')
             model.load_state_dict(torch.load(weights_path, weights_only=True, map_location=torch.device('cpu')))
             
-            if 'distil' in method:
+            projector_weights_path = os.path.join(data_dir, f'bert_{args.split}', args.model , method, 'projector.pth')
+            if os.path.exists(projector_weights_path):
                 # Use teacher_model_info to get the correct dimension for the projector
                 teacher_dim = teacher_model_info[args.model]["dim"]
                 projector = nn.Linear(model.config.hidden_size, teacher_dim).to(device)
-                weights_path = os.path.join(data_dir, f'bert_{args.split}', args.model , method, 'projector.pth')
-                projector.load_state_dict(torch.load(weights_path, weights_only=True, map_location=torch.device('cpu')))
+                print(f"Found and loading projector from {projector_weights_path}")
+                projector.load_state_dict(torch.load(projector_weights_path, weights_only=True, map_location=torch.device('cpu')))
                 projector.eval()
         else:
             print('Loaded base student model only')
@@ -233,7 +235,7 @@ if __name__ == "__main__":
                 sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
                 mean_pooled_embeddings = sum_embeddings / sum_mask
 
-                if 'distil' in method:
+                if projector is not None:
                     mean_pooled_embeddings = projector(mean_pooled_embeddings)
 
                 normalized_embeddings = F.normalize(mean_pooled_embeddings, p=2, dim=-1)
