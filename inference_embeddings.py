@@ -20,6 +20,7 @@ teacher_model_info = {
     "deepseek":   {"path": "/mnt/ambrym2/datasets/distil/llms/deepseek-coder-7b-base-v1.5", "dim": 4096},
     "qwen":       {"path": "/mnt/ambrym2/datasets/distil/llms/Qwen2.5-Coder-7B", "dim": 3584},
     "codellama":  {"path": "/mnt/ambrym2/datasets/distil/llms/CodeLlama-7b-hf", "dim": 4096},
+    "nova":      {"path": "/mnt/ambrym2/datasets/distil/llms/Novacode-7B", "dim": 2048},    
 }
 teacher_model_names = list(teacher_model_info.keys())
 
