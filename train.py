@@ -2,7 +2,7 @@ import os
 from datasets import load_from_disk
 import argparse
 import json
-from transformers import BertForMaskedLM, Trainer, TrainingArguments, BertTokenizerFast, DataCollatorWithPadding
+from transformers import BertForMaskedLM, Trainer, TrainingArguments, BertTokenizerFast, DataCollatorWithPadding, BertConfig
 import wandb
 from src.models.models import StudentWithProjector, StudentWithCosine, StudentWithInfoNCE
 import torch
@@ -29,6 +29,9 @@ if __name__ == "__main__":
     parser.add_argument("--max_len", default=128, type=int)
     parser.add_argument("--finetune_checkpoint", type=str, default=None, help="Checkpoint name to start finetuning from (e.g., 'distil_cosine_1024')")
     parser.add_argument("--use_projector_in_ft", action='store_true', help="Use the projector from the checkpoint during finetuning.")
+    parser.add_argument("--student_model_name_or_path", type=str, default=None, help="Path or HuggingFace ID of the student model to initialize. If None, defaults to the split specific MLM model.")
+    parser.add_argument("--from_scratch", action='store_true', help="Initialize the student model with random weights using the default architecture instead of loading pretrained weights.")
+    parser.add_argument("--resume_from_checkpoint", action='store_true', help="Resume training from the last checkpoint in the output directory.")
 
     args = parser.parse_args()
     print(f'training on split {args.split} and method {args.method} and teacher {args.teacher_type} and max_len {args.max_len}')
@@ -95,7 +98,24 @@ if __name__ == "__main__":
     val_dataset = val_dataset.map(format_and_tokenize, batched=True, num_proc=os.cpu_count() // 2, remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=val_cache_tokenization_path)
 
     ### model
-    student_model = BertForMaskedLM.from_pretrained(os.path.join(data_dir, f'bert_mlm_{args.split}', 'best_model'))
+    if args.from_scratch:
+        print("Initializing student model from scratch with default architecture...")
+        config = BertConfig(
+            vocab_size=len(tokenizer),
+            hidden_size=512,
+            num_attention_heads=8,
+            num_hidden_layers=6,
+            intermediate_size=2048,
+            max_position_embeddings=1024
+        )
+        student_model = BertForMaskedLM(config=config)
+    elif args.student_model_name_or_path:
+        model_path = args.student_model_name_or_path
+        student_model = BertForMaskedLM.from_pretrained(model_path)
+    else:
+        model_path = os.path.join(data_dir, f'bert_mlm_{args.split}', 'best_model')
+        student_model = BertForMaskedLM.from_pretrained(model_path)
+
     projector_to_use = None 
 
     if args.finetune_checkpoint:
@@ -319,16 +339,27 @@ if __name__ == "__main__":
             finetuning_details += "_with_proj"
         else:
             finetuning_details += "_no_proj"
-    run_name += finetuning_details
-
+    
+    # Add initialization details
+    init_suffix = ""
+    if args.from_scratch:
+        init_suffix = "_scratch"
+    elif args.student_model_name_or_path:
+        init_suffix = "_custom"
+    else:
+        init_suffix = ""
+        
+    run_name += finetuning_details + init_suffix
+    print(f'run name: {run_name}')
     wandb.init(
         project=project_name,
         name=run_name
     )
 
     # output dir
-    output_dir_name = f'{method}_{args.max_len}{finetuning_details}'
+    output_dir_name = f'{method}_{args.max_len}{finetuning_details}{init_suffix}'
     output_dir = os.path.join(output_dir, f"bert_{args.split}", teacher_type, output_dir_name)
+    print(f'output dir: {output_dir}')
     os.makedirs(output_dir, exist_ok=True)
 
     # training args
@@ -371,7 +402,8 @@ if __name__ == "__main__":
     )
 
     # start training
-    trainer.train()
+    resume_checkpoint = True if args.resume_from_checkpoint else None
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
 
     torch.save(model.student.state_dict(), os.path.join(output_dir, 'student.pth'))
 
