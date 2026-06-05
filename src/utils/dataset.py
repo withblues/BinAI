@@ -2,33 +2,38 @@ import torch
 from torch.utils.data import Dataset
     
 class CosineDataset(Dataset):
-    def __init__(self, dataset, lookup, id2idx):
+    def __init__(self, dataset, lookup, id2idx, top_k=None):
         self.dataset = dataset
         self.lookup = lookup
         self.id2idx = id2idx
+        self.top_k = top_k
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
         anchor = self.dataset[idx]
-        target_ids, cosine_scores = self.lookup[anchor["unique_id"]]
+        target_ids, _ = self.lookup[anchor["unique_id"]]
+        
+        # Only slice if top_k is explicitly provided
+        if self.top_k is not None:
+            target_ids = target_ids[:self.top_k]
 
         input_ids = [anchor["input_ids"]]
         attention_masks = [anchor["attention_mask"]]
+        teacher_embeddings = [anchor["labels"]] # The vector from the base dataset
 
         for tid in target_ids:
             t_idx = self.id2idx[tid]           
             target_example = self.dataset[t_idx]
             input_ids.append(target_example["input_ids"])
             attention_masks.append(target_example["attention_mask"])
-
-        labels = cosine_scores
+            teacher_embeddings.append(target_example["labels"])
 
         return {
             "input_ids": input_ids,
             "attention_mask": attention_masks,
-            "labels": labels,
+            "teacher_embeddings": teacher_embeddings,
         }
     
 class InfoNCEDatasetWithLookup(Dataset):
