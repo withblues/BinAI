@@ -194,17 +194,33 @@ if __name__ == "__main__":
     parser.add_argument("--method", required=True, help="Method name for the model (e.g., 'teacher_model')")
     parser.add_argument("--batch_size", default=1024, type=int, help="Batch size for GPU queries. Tune based on VRAM.")
     parser.add_argument("--model_name", default='clap', help="Model name for student-teacher evaluation.")
+    parser.add_argument("--embeddings_dataset_path", type=str, required=True, help="Path to the pre-computed embeddings dataset.")
     args = parser.parse_args()
 
-    print(f'compute metrics with {args.method} on split {args.split}')
+    # The method and init_suffix are now only for naming the output report
+    method_name_with_suffix = args.method
+
+    print(f'compute metrics with {method_name_with_suffix} on split {args.split}')
     IS_STUDENT_EVAL = args.method not in ['clap', 'deepseek', 'starcoder2', 'qwen' ,'llm4decompile', 'nova']
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f'device {device}')
     K_VALUES = [1, 5, 10, 50, 100, 512, 1024]
 
-    source_dataset = load_from_disk(os.path.join(args.data_dir, 'inference/datasets', args.split, args.model_name, f'{args.method}-embeddings'))
+    source_dataset_path = args.embeddings_dataset_path
+    print(f'Loading dataset from {source_dataset_path}')
+    source_dataset = load_from_disk(source_dataset_path)
     source_dataset.set_format("numpy", columns=['unique_id', 'embedding'])
+
+    with open(os.path.join(args.data_dir, f"cross_{args.split}_split.json")) as f:
+        indices = json.load(f)
+
+    test_ids = set(indices["test"])
+
+    # source_dataset = load_from_disk(os.path.join(args.data_dir, f'assembly_x64_1024_{args.method}'))
+    # source_dataset = source_dataset.rename_column(f'{args.method}_embedding', 'embedding')
+    # source_dataset = source_dataset.filter(lambda batch: [uid in test_ids for uid in batch["unique_id"]], batched=True, num_proc=16)
+    # source_dataset.set_format("numpy", columns=['unique_id', 'embedding'])
 
     # load into ram
     all_data_np = source_dataset[:] 
@@ -216,9 +232,9 @@ if __name__ == "__main__":
     test_ids_set = set(all_ids)
 
     if IS_STUDENT_EVAL:
-        print("Loading pre-computed teacher scores")
-        teacher_matrix_path = os.path.join(args.output_dir, 'inference/cosine_scores', args.split, f"clap_similarity_matrix.mmap")
-        teacher_ids_path = os.path.join(args.output_dir, 'inference/cosine_scores', args.split, f"clap_ids.npy")
+        print(f"Loading pre-computed teacher scores for {args.model_name}")
+        teacher_matrix_path = os.path.join(args.output_dir, 'inference/cosine_scores', args.split, f"{args.model_name}_similarity_matrix.mmap")
+        teacher_ids_path = os.path.join(args.output_dir, 'inference/cosine_scores', args.split, f"{args.model_name}_ids.npy")
 
         teacher_ids = np.load(teacher_ids_path, allow_pickle=True)
         assert np.array_equal(all_ids, teacher_ids), "Mismatch between student and teacher IDs!"
@@ -252,15 +268,15 @@ if __name__ == "__main__":
         gt_lookup[key].append(idx)
 
     # output path
-    output_path_matrix = os.path.join(args.output_dir, 'inference/cosine_scores',  args.split, f"{args.method}_similarity_matrix.mmap")
-    output_path_ids = os.path.join(args.output_dir, 'inference/cosine_scores',  args.split, f"{args.method}_ids.npy")
+    output_path_matrix = os.path.join(args.output_dir, 'inference/cosine_scores',  args.split, f"{method_name_with_suffix}_similarity_matrix.mmap")
+    output_path_ids = os.path.join(args.output_dir, 'inference/cosine_scores',  args.split, f"{method_name_with_suffix}_ids.npy")
     os.makedirs(os.path.dirname(output_path_matrix), exist_ok=True)
 
     # allocate space
     if not IS_STUDENT_EVAL:
         print(f"Running in TEACHER mode. Scores will be saved to disk.")
-        output_path_matrix = os.path.join(args.output_dir, 'inference/cosine_scores',  args.split, f"{args.method}_similarity_matrix.mmap")
-        output_path_ids = os.path.join(args.output_dir, 'inference/cosine_scores',  args.split, f"{args.method}_ids.npy")
+        output_path_matrix = os.path.join(args.output_dir, 'inference/cosine_scores',  args.split, f"{method_name_with_suffix}_similarity_matrix.mmap")
+        output_path_ids = os.path.join(args.output_dir, 'inference/cosine_scores',  args.split, f"{method_name_with_suffix}_ids.npy")
         os.makedirs(os.path.dirname(output_path_matrix), exist_ok=True)
         similarity_matrix_mmap = np.memmap(output_path_matrix, dtype='float32', mode='w+', shape=(num_rows, num_rows - 1))    
         np.save(output_path_ids, all_ids)
@@ -272,7 +288,6 @@ if __name__ == "__main__":
     all_embeddings_gpu = torch.from_numpy(all_embeddings_np).to(device)
     all_embeddings_T_gpu = all_embeddings_gpu.T
 
-    stream = torch.cuda.Stream()
 
     # dict for metrics
     metrics_results = {'mrr': []}
@@ -343,7 +358,7 @@ if __name__ == "__main__":
     print(f"\nMatrix generation complete. Took {(end_time - start_time) / 60:.2f} minutes.")
     
     if metrics_results['mrr']:
-        final_report = {"model_name": args.method}
+        final_report = {"model_name": method_name_with_suffix}
         print("\n--- Teacher Performance Metrics ---")
         final_report['mrr'] = np.mean(metrics_results['mrr'])
         print(f"Teacher MRR: {final_report['mrr']:.4f}")
@@ -360,7 +375,7 @@ if __name__ == "__main__":
             print(f"Teacher Precision@{k}: {final_report[f'precision@{k}']:.4f}")
             print(f"Teacher Recall@{k}: {final_report[f'recall@{k}']:.4f}")
 
-        report_path = os.path.join(args.output_dir, 'inference/metrics', args.split, args.model_name, f"{args.method}_metrics_report.json")
+        report_path = os.path.join(args.output_dir, 'inference/metrics', args.split, args.model_name, f"{method_name_with_suffix}_metrics_report.json")
         os.makedirs(os.path.dirname(report_path), exist_ok=True)
         with open(report_path, 'w') as f:
             json.dump(final_report, f, indent=4)

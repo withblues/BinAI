@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from datasets import load_from_disk, Dataset, Features, Value, Sequence
 from torch.utils.data import DataLoader
-from transformers import AutoModel, AutoTokenizer, BertTokenizerFast, BertForMaskedLM, DataCollatorWithPadding
+from transformers import AutoModel, AutoTokenizer, BertTokenizerFast, BertForMaskedLM, DataCollatorWithPadding, BertConfig
 from src.utils.gpu_stats import GPU
 import re
 
@@ -97,6 +97,8 @@ if __name__ == "__main__":
     parser.add_argument("--model", default='clap', type=str, 
                         help="Can be a teacher model or a student model config.")
     parser.add_argument("--is_teacher", action='store_true',)
+    parser.add_argument("--checkpoint_dir", type=str, default=None, help="Path to checkpoint directory containing student.pth and optionally projector.pth.")
+    parser.add_argument("--from_scratch", action='store_true', help="Initialize the student model with random weights using the default architecture instead of loading pretrained weights.")
     args = parser.parse_args()
 
     data_dir = args.data_dir
@@ -165,26 +167,56 @@ if __name__ == "__main__":
         test_dataset = test_dataset.map(format_and_tokenize, batched=True, num_proc=32, remove_columns=columns_to_remove, desc='Tokenizing data for student model...', cache_file_name=test_cache_tokenization_path)
 
         # Load student model and projector
-        model = BertForMaskedLM.from_pretrained(os.path.join(data_dir, f'bert_mlm_{args.split}', 'best_model'))
-
         projector = None
-        if method != 'base':
-            weights_path = os.path.join(data_dir,f'bert_{args.split}', args.model , method, 'student.pth')
-            model.load_state_dict(torch.load(weights_path, weights_only=True, map_location=torch.device('cpu')))
+        if args.checkpoint_dir:
+            print(f"--- Loading model from checkpoint directory: {args.checkpoint_dir} ---")
+            config = BertConfig(
+                vocab_size=len(tokenizer), hidden_size=512, num_attention_heads=8,
+                num_hidden_layers=6, intermediate_size=2048, max_position_embeddings=1024
+            )
+            model = BertForMaskedLM(config=config)
             
-            projector_weights_path = os.path.join(data_dir, f'bert_{args.split}', args.model , method, 'projector.pth')
+            student_weights_path = os.path.join(args.checkpoint_dir, 'student.pth')
+            if os.path.exists(student_weights_path):
+                model.load_state_dict(torch.load(student_weights_path, weights_only=True, map_location=torch.device('cpu')))
+                print(f"--- Loaded student weights from: {student_weights_path} ---")
+            else:
+                raise FileNotFoundError(f"student.pth not found in checkpoint_dir: {args.checkpoint_dir}")
+
+            projector_weights_path = os.path.join(args.checkpoint_dir, 'projector.pth')
             if os.path.exists(projector_weights_path):
-                # Use teacher_model_info to get the correct dimension for the projector
+                print(f"--- Found projector.pth, loading projector. ---")
                 teacher_dim = teacher_model_info[args.model]["dim"]
-                projector = nn.Linear(model.config.hidden_size, teacher_dim).to(device)
-                print(f"Found and loading projector from {projector_weights_path}")
+                projector = nn.Linear(model.config.hidden_size, teacher_dim)
                 projector.load_state_dict(torch.load(projector_weights_path, weights_only=True, map_location=torch.device('cpu')))
                 projector.eval()
+            else:
+                print(f"--- No projector.pth found in checkpoint. ---")
+        
+        elif args.from_scratch:
+            print("--- Initializing STUDENT model from scratch (random weights). ---")
+            config = BertConfig(
+                vocab_size=len(tokenizer), hidden_size=512, num_attention_heads=8,
+                num_hidden_layers=6, intermediate_size=2048, max_position_embeddings=1024
+            )
+            model = BertForMaskedLM(config=config)
+        
         else:
-            print('Loaded base student model only')
+            print("--- Loading default base MLM model. ---")
+            model = BertForMaskedLM.from_pretrained(os.path.join(data_dir, f'bert_mlm_{args.split}', 'best_model'))
+
+        # The 'method' argument is now primarily for naming the output file.
+        # We need to preserve the init_suffix for correct output naming.
+        init_suffix = ""
+        if args.from_scratch:
+            init_suffix = "_scratch"
+        
+        print(f"--- Using method '{args.method}' for output naming. ---")
         
         model = model.to(device)
         model.eval()
+        if projector is not None:
+            projector = projector.to(device)
         
         data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding='longest')
 
@@ -258,7 +290,9 @@ if __name__ == "__main__":
 
     output_path_base = os.path.join(output_dir, "inference", "datasets", args.split, args.model)
     os.makedirs(output_path_base, exist_ok=True)
-    output_filename_prefix = args.model if args.is_teacher else method
+    
+    # Update output filename prefix
+    output_filename_prefix = args.model if args.is_teacher else (method + init_suffix)
     metadata_file_path = os.path.join(output_path_base, f"{output_filename_prefix}-metadata.json")
 
     all_runs_data = []
@@ -327,7 +361,7 @@ if __name__ == "__main__":
         json.dump(data_to_save, f, indent=4)
 
     # safe dataset 
-    embeddings_save_path = os.path.join(output_path_base, f"{method}-embeddings")
+    embeddings_save_path = os.path.join(output_path_base, f"{method}{init_suffix}-embeddings")
     print(f"Saving embeddings dataset to {embeddings_save_path}...")
     if not os.path.exists(embeddings_save_path):
         print("Creating final embeddings dataset...")
