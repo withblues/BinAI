@@ -335,6 +335,7 @@ if __name__ == "__main__":
     parser.add_argument("--student_model_name_or_path", type=str, default=None, help="Path or HuggingFace ID of the student model to initialize. If None, defaults to the split specific MLM model.")
     parser.add_argument("--from_scratch", action='store_true', help="Initialize the student model with random weights using the default architecture instead of loading pretrained weights.")
     parser.add_argument("--resume_from_checkpoint", action='store_true', help="Resume training from the last checkpoint in the output directory.")
+    parser.add_argument("--batch_size", type=int, default=128, help="Per-device train and eval batch size.")
     
     # Joint training arguments
     parser.add_argument("--lambda_mlm", type=float, default=1.0)
@@ -795,9 +796,9 @@ if __name__ == "__main__":
         save_strategy="steps",
         save_steps=0.2,
         eval_strategy='steps',
-        eval_steps=0.2,
-        per_device_train_batch_size=128,
-        per_device_eval_batch_size=128,
+        eval_steps=0.20,
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=1,
         num_train_epochs=6,
         max_steps=args.max_steps, # 14046 for project split
