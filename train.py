@@ -747,7 +747,7 @@ if __name__ == "__main__":
         
     ol_aux_details = ""
     lambda_details = ""
-    if technique == 'joint':
+    if technique == 'joint' or technique == 'joint_in_batch':
         if args.use_ol_aux:
             ol_aux_details = f"_olaux_b{args.ol_aux_beta}_h{args.ol_aux_horizon}"
             if args.ol_aux_strict_paper:
@@ -755,6 +755,9 @@ if __name__ == "__main__":
         else:
             if args.lambda_mlm != 1.0 or args.lambda_distill != 1.0 or args.lambda_nce != 1.0:
                 lambda_details = f"_m{args.lambda_mlm}_d{args.lambda_distill}_n{args.lambda_nce}"
+            
+    if getattr(args, 'use_cross_gpu_negatives', False):
+        lambda_details += "_crossgpu"
             
     nce_details = ""
     if args.nce_start_step > 0:
