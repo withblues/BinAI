@@ -105,3 +105,44 @@ class InfoNCEDatasetWithLookup(Dataset):
             "attention_mask": all_attention_masks,
             "labels": 0,
         }
+
+class InBatchInfoNCEDataset(Dataset):
+    def __init__(self, base_dataset, lookup, id2idx):
+        self.base_dataset = base_dataset
+        self.lookup = lookup
+        self.id2idx = id2idx
+        
+        # We still flatten the lookup for easy indexing
+        self.flat_examples = []
+        for anchor_id, examples in lookup.items():
+            for ex in examples:
+                self.flat_examples.append({
+                    'anchor_id': anchor_id,
+                    'positive_id': ex['positive_id']
+                })
+
+    def __len__(self):
+        return len(self.flat_examples)
+
+    def __getitem__(self, idx):
+        example = self.flat_examples[idx]
+        anchor_id = example['anchor_id']
+        positive_id = example['positive_id']
+
+        anchor_tokens = self.base_dataset[self.id2idx[anchor_id]]
+        positive_tokens = self.base_dataset[self.id2idx[positive_id]]
+        
+        # We need input_ids, attention_mask, binary_name, function_names, and teacher embeddings
+        return {
+            "anchor_input_ids": anchor_tokens["input_ids"],
+            "anchor_attention_mask": anchor_tokens["attention_mask"],
+            "anchor_binary_name": anchor_tokens["binary_name"],
+            "anchor_function_name": anchor_tokens["function_names"],
+            "anchor_teacher_embedding": anchor_tokens["labels"],
+            
+            "positive_input_ids": positive_tokens["input_ids"],
+            "positive_attention_mask": positive_tokens["attention_mask"],
+            "positive_binary_name": positive_tokens["binary_name"],
+            "positive_function_name": positive_tokens["function_names"],
+            "positive_teacher_embedding": positive_tokens["labels"]
+        }

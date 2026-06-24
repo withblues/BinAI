@@ -1,9 +1,25 @@
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
+import numpy as np
 
 
-    
+class GatherLayer(torch.autograd.Function):
+    """
+    Gather tensors from all workers with support for backward propagation:
+    This implementation does not cut the gradients as torch.distributed.all_gather does.
+    """
+    @staticmethod
+    def forward(ctx, x):
+        output = [torch.empty_like(x) for _ in range(torch.distributed.get_world_size())]
+        torch.distributed.all_gather(output, x)
+        return tuple(output)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        all_gradients = torch.stack(grads)
+        torch.distributed.all_reduce(all_gradients)
+        return all_gradients[torch.distributed.get_rank()]
 class StudentWithProjector(nn.Module):
     def __init__(self, student_model, teacher_dim, loss_fn):
         super().__init__()
@@ -147,12 +163,15 @@ class StudentWithInfoNCE(nn.Module):
         }
     
 class JointAssemblyStudent(nn.Module):
-    def __init__(self, student_model, num_targets_per_anchor, projector=None, lambda_mlm=1.0, lambda_nce=1.0, lambda_distill=1.0, distill_loss_type='mse'):
+    def __init__(self, student_model, num_targets_per_anchor, projector=None, lambda_mlm=1.0, lambda_nce=1.0, lambda_distill=1.0, distill_loss_type='mse', temperature_init=0.07):
         super().__init__()
         # student_model should be initialized as BertForMaskedLM
         self.student = student_model 
         self.num_targets_per_anchor = num_targets_per_anchor
         self.projector = projector
+        
+        # Fixed temperature for InfoNCE (not learnable — prevents optimizer from escaping)
+        self.temperature = temperature_init
         
         # Loss functions
         self.infonce_criterion = nn.CrossEntropyLoss()
@@ -228,8 +247,8 @@ class JointAssemblyStudent(nn.Module):
             anchor_embeddings = grouped_embeddings[:, 0, :]
             target_embeddings = grouped_embeddings[:, 1:, :]
 
-            # Calculate Cosine Similarities (Student-internal)
-            student_scores = torch.einsum('bh,bkh->bk', anchor_embeddings, target_embeddings)
+            # Calculate Cosine Similarities scaled by fixed temperature
+            student_scores = torch.einsum('bh,bkh->bk', anchor_embeddings, target_embeddings) / self.temperature
 
             # InfoNCE Loss
             ground_truth_labels = torch.zeros(actual_batch_size, dtype=torch.long, device=student_scores.device)
@@ -272,16 +291,13 @@ class JointAssemblyStudent(nn.Module):
         # We extract the python float values from the buffers to prevent PyTorch from
         # adding the buffer tensors to the computation graph. This avoids the 
         # "modified by an inplace operation" RuntimeError when we update them later.
-        w_m = self.w_mlm.item() if isinstance(self.w_mlm, torch.Tensor) else self.w_mlm
-        w_d = self.w_distill.item() if isinstance(self.w_distill, torch.Tensor) else self.w_distill
-
         if use_ol_aux:
-            # We use standard linear combination here to prevent exploding gradients (NaNs)
-            # that occur when using torch.log() on losses that approach zero.
-            total_loss = (self.lambda_nce * nce_loss) + \
-                         (w_m * mlm_loss) + \
-                         (w_d * distill_loss)
+            # Hide buffers from torch.compile. Trainer overrides this loss anyway.
+            total_loss = nce_loss + mlm_loss + distill_loss
         else:
+            w_m = self.w_mlm.detach().clone() if isinstance(self.w_mlm, torch.Tensor) else self.w_mlm
+            w_d = self.w_distill.detach().clone() if isinstance(self.w_distill, torch.Tensor) else self.w_distill
+            
             # Standard linear combination if OL-AUX is disabled
             total_loss = (self.lambda_nce * nce_loss) + \
                          (w_m * mlm_loss) + \
@@ -292,7 +308,290 @@ class JointAssemblyStudent(nn.Module):
             "nce_loss": nce_loss,
             "mlm_loss": mlm_loss,
             "distill_loss": distill_loss,
-            "logits": student_scores,
-            "w_mlm": self.w_mlm,
-            "w_distill": self.w_distill
+            "logits": student_scores
+        }
+
+class StudentWithInBatchCosine(nn.Module):
+    def __init__(self, student_model, projector=None):
+        super().__init__()
+        self.student = student_model
+        self.projector = projector
+        self.criterion = nn.MSELoss()
+
+    def forward(self, input_ids, attention_mask=None, teacher_embeddings=None, **kwargs):
+        # 1. Forward pass
+        outputs = self.student.bert(input_ids=input_ids, attention_mask=attention_mask)
+        token_embeddings = outputs.last_hidden_state
+        
+        # 2. Mean pooling
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).to(token_embeddings.dtype)
+        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+        sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+        mean_pooled_embeddings = sum_embeddings / sum_mask
+
+        if self.projector:
+            projected_embeddings = self.projector(mean_pooled_embeddings)
+            student_embeddings = F.normalize(projected_embeddings, p=2, dim=-1)
+        else:
+            student_embeddings = F.normalize(mean_pooled_embeddings, p=2, dim=-1)
+
+        loss = None
+        predicted_scores = None
+
+        if teacher_embeddings is not None:
+            teacher_embeddings = F.normalize(teacher_embeddings, p=2, dim=-1)
+            
+            # Calculate BxB similarity matrices
+            student_sims = torch.matmul(student_embeddings, student_embeddings.T)
+            teacher_sims = torch.matmul(teacher_embeddings, teacher_embeddings.T)
+
+            loss = self.criterion(student_sims, teacher_sims)
+            predicted_scores = student_sims
+
+        return {
+            "loss": loss,
+            "logits": predicted_scores
+        }
+
+class StudentWithInBatchInfoNCE(nn.Module):
+    def __init__(self, student_model, projector=None, temperature=0.05):
+        super().__init__()
+        self.student = student_model
+        self.projector = projector
+        self.temperature = temperature
+        self.criterion = nn.CrossEntropyLoss()
+
+    def forward(self, input_ids, attention_mask=None, binary_names=None, function_names=None, **kwargs):
+        # 1. Forward pass
+        outputs = self.student.bert(input_ids=input_ids, attention_mask=attention_mask)
+        token_embeddings = outputs.last_hidden_state
+        
+        # 2. Mean pooling
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).to(token_embeddings.dtype)
+        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+        sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+        mean_pooled_embeddings = sum_embeddings / sum_mask
+
+        if self.projector:
+            projected_embeddings = self.projector(mean_pooled_embeddings)
+            student_embeddings = F.normalize(projected_embeddings, p=2, dim=-1)
+        else:
+            student_embeddings = F.normalize(mean_pooled_embeddings, p=2, dim=-1)
+
+        loss = None
+        predicted_scores = None
+
+        if binary_names is not None and function_names is not None:
+            # We assume batch is structured: first B are anchors, next B are positives
+            total_b = student_embeddings.shape[0]
+            B = total_b // 2
+
+            # Compute pairwise similarities (2B x 2B)
+            sim_matrix = torch.matmul(student_embeddings, student_embeddings.T) / self.temperature
+            predicted_scores = sim_matrix
+
+            # Build masking matrix for collisions
+            bin_names = np.array(binary_names)
+            func_names = np.array(function_names)
+            
+            # is_name_collision[i, j] = True if they have same bin and func
+            same_bin = (bin_names[:, None] == bin_names[None, :])
+            same_func = (func_names[:, None] == func_names[None, :])
+            is_name_collision = torch.tensor(same_bin & same_func, device=sim_matrix.device)
+            
+            # is_hash_collision[i, j] = True if they have perfectly identical token sequences
+            is_hash_collision = torch.all(input_ids[:, None, :] == input_ids[None, :, :], dim=-1)
+
+            # Combined collision mask
+            is_collision = is_name_collision | is_hash_collision
+
+            # Targets: for i < B target is i + B, for i >= B target is i - B
+            targets = torch.empty(total_b, dtype=torch.long, device=sim_matrix.device)
+            targets[:B] = torch.arange(B, total_b, device=sim_matrix.device)
+            targets[B:] = torch.arange(0, B, device=sim_matrix.device)
+            
+            # We mask out the diagonal (cannot be target for itself)
+            sim_matrix.fill_diagonal_(-float('inf'))
+            
+            # Mask out collisions (false negatives)
+            is_explicit_target = torch.zeros_like(is_collision, dtype=torch.bool)
+            is_explicit_target[torch.arange(total_b), targets] = True
+            
+            mask_out = is_collision & ~is_explicit_target
+            sim_matrix.masked_fill_(mask_out, -float('inf'))
+
+            loss = self.criterion(sim_matrix, targets)
+
+        return {
+            "loss": loss,
+            "logits": predicted_scores
+        }
+
+class StudentWithJointInBatch(nn.Module):
+    def __init__(self, student_model, projector=None, temperature=0.05, lambda_nce=1.0, lambda_distill=1.0, lambda_mlm=1.0, use_cross_gpu_negatives=False):
+        super().__init__()
+        self.student = student_model
+        self.projector = projector
+        self.temperature = temperature
+        self.use_cross_gpu_negatives = use_cross_gpu_negatives
+        
+        self.lambda_nce = lambda_nce
+        self.lambda_distill = lambda_distill
+        self.lambda_mlm = lambda_mlm
+        
+        self.infonce_criterion = nn.CrossEntropyLoss()
+        self.distill_criterion = nn.MSELoss()
+
+    def forward(self, input_ids, attention_mask=None, binary_names=None, function_names=None, teacher_embeddings=None, masked_input_ids=None, mlm_labels=None, **kwargs):
+        
+        mlm_loss = 0.0
+        
+        # --- PASS 1: MLM on Anchor Sequences ---
+        # If masked_input_ids are provided, we compute the MLM loss on the first half (the anchors)
+        if masked_input_ids is not None and mlm_labels is not None and self.lambda_mlm > 0:
+            B = input_ids.shape[0] // 2
+            
+            # Forward pass ONLY the anchors through the MLM head
+            anchor_masked_input_ids = masked_input_ids[:B]
+            anchor_attention_mask = attention_mask[:B]
+            anchor_mlm_labels = mlm_labels[:B]
+            
+            mlm_outputs = self.student(
+                input_ids=anchor_masked_input_ids,
+                attention_mask=anchor_attention_mask,
+                labels=anchor_mlm_labels
+            )
+            mlm_loss = mlm_outputs.loss
+
+        # --- PASS 2: Clean Forward Pass for InfoNCE & Distillation ---
+        outputs = self.student.bert(input_ids=input_ids, attention_mask=attention_mask)
+        token_embeddings = outputs.last_hidden_state
+        
+        # 2. Mean pooling
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).to(token_embeddings.dtype)
+        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+        sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+        mean_pooled_embeddings = sum_embeddings / sum_mask
+
+        if self.projector:
+            projected_embeddings = self.projector(mean_pooled_embeddings)
+            student_embeddings = F.normalize(projected_embeddings, p=2, dim=-1)
+        else:
+            student_embeddings = F.normalize(mean_pooled_embeddings, p=2, dim=-1)
+
+        total_loss = None
+        predicted_scores = None
+
+        if binary_names is not None and function_names is not None and teacher_embeddings is not None:
+            # We assume batch is structured: first B are anchors, next B are positives
+            total_b = student_embeddings.shape[0]
+            B = total_b // 2
+
+            # --- InfoNCE Loss ---
+            if self.use_cross_gpu_negatives and torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+                world_size = torch.distributed.get_world_size()
+                
+                # Gather embeddings with Autograd support
+                global_student_embeddings = torch.cat(GatherLayer.apply(student_embeddings), dim=0)
+                sim_matrix = torch.matmul(student_embeddings, global_student_embeddings.T) / self.temperature
+                
+                # Gather names
+                local_names = {'bin': binary_names, 'func': function_names}
+                gathered_names = [None for _ in range(world_size)]
+                torch.distributed.all_gather_object(gathered_names, local_names)
+                
+                global_bin_names = []
+                global_func_names = []
+                for n_dict in gathered_names:
+                    global_bin_names.extend(n_dict['bin'])
+                    global_func_names.extend(n_dict['func'])
+                    
+                global_bin_names = np.array(global_bin_names)
+                global_func_names = np.array(global_func_names)
+                
+                # Gather input_ids for hash collisions
+                gathered_input_ids = [torch.zeros_like(input_ids) for _ in range(world_size)]
+                torch.distributed.all_gather(gathered_input_ids, input_ids)
+                global_input_ids = torch.cat(gathered_input_ids, dim=0)
+                
+                is_hash_collision = torch.all(input_ids[:, None, :] == global_input_ids[None, :, :], dim=-1)
+                
+                # Local names
+                local_bin_names = np.array(binary_names)
+                local_func_names = np.array(function_names)
+                same_bin = (local_bin_names[:, None] == global_bin_names[None, :])
+                same_func = (local_func_names[:, None] == global_func_names[None, :])
+                is_name_collision = torch.tensor(same_bin & same_func, device=sim_matrix.device)
+                
+                total_global_b = global_student_embeddings.shape[0]
+                targets = torch.empty(total_b, dtype=torch.long, device=sim_matrix.device)
+                
+                # True positive targets are offset by the current GPU's rank block
+                offset = rank * total_b
+                targets[:B] = torch.arange(B, total_b, device=sim_matrix.device) + offset
+                targets[B:] = torch.arange(0, B, device=sim_matrix.device) + offset
+                
+                is_collision = is_name_collision | is_hash_collision
+                
+                # Mask out self (diagonal relative to the offset block)
+                for i in range(total_b):
+                    sim_matrix[i, offset + i] = -float('inf')
+                    
+                is_explicit_target = torch.zeros_like(is_collision, dtype=torch.bool)
+                is_explicit_target[torch.arange(total_b), targets] = True
+                
+                mask_out = is_collision & ~is_explicit_target
+                sim_matrix.masked_fill_(mask_out, -float('inf'))
+                
+            else:
+                sim_matrix = torch.matmul(student_embeddings, student_embeddings.T) / self.temperature
+                
+                bin_names = np.array(binary_names)
+                func_names = np.array(function_names)
+                
+                same_bin = (bin_names[:, None] == bin_names[None, :])
+                same_func = (func_names[:, None] == func_names[None, :])
+                is_name_collision = torch.tensor(same_bin & same_func, device=sim_matrix.device)
+                is_hash_collision = torch.all(input_ids[:, None, :] == input_ids[None, :, :], dim=-1)
+
+                is_collision = is_name_collision | is_hash_collision
+
+                targets = torch.empty(total_b, dtype=torch.long, device=sim_matrix.device)
+                targets[:B] = torch.arange(B, total_b, device=sim_matrix.device)
+                targets[B:] = torch.arange(0, B, device=sim_matrix.device)
+                
+                sim_matrix.fill_diagonal_(-float('inf'))
+                
+                is_explicit_target = torch.zeros_like(is_collision, dtype=torch.bool)
+                is_explicit_target[torch.arange(total_b), targets] = True
+                
+                mask_out = is_collision & ~is_explicit_target
+                sim_matrix.masked_fill_(mask_out, -float('inf'))
+
+            nce_loss = self.infonce_criterion(sim_matrix, targets)
+            predicted_scores = sim_matrix
+
+            # --- Distillation Loss (Matching similarity matrices like cosine_in_batch) ---
+            teacher_embeddings = F.normalize(teacher_embeddings, p=2, dim=-1)
+            
+            if self.use_cross_gpu_negatives and torch.distributed.is_initialized():
+                global_teacher_embeddings = torch.cat(GatherLayer.apply(teacher_embeddings), dim=0)
+                teacher_sims = torch.matmul(teacher_embeddings, global_teacher_embeddings.T)
+                student_sims_unscaled = torch.matmul(student_embeddings, global_student_embeddings.T)
+            else:
+                teacher_sims = torch.matmul(teacher_embeddings, teacher_embeddings.T)
+                student_sims_unscaled = torch.matmul(student_embeddings, student_embeddings.T)
+                
+            distill_loss = self.distill_criterion(student_sims_unscaled, teacher_sims)
+            
+            # --- Total Loss ---
+            total_loss = (self.lambda_nce * nce_loss) + (self.lambda_distill * distill_loss) + (self.lambda_mlm * mlm_loss)
+
+        return {
+            "loss": total_loss,
+            "logits": predicted_scores,
+            "nce_loss": nce_loss if nce_loss is not None else 0.0,
+            "distill_loss": distill_loss if distill_loss is not None else 0.0,
+            "mlm_loss": mlm_loss
         }

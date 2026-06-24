@@ -4,10 +4,10 @@ import argparse
 import json
 from transformers import BertForMaskedLM, Trainer, TrainingArguments, BertTokenizerFast, DataCollatorWithPadding, BertConfig, DataCollatorForLanguageModeling
 import wandb
-from src.models.models import StudentWithProjector, StudentWithCosine, StudentWithInfoNCE, JointAssemblyStudent
+from src.models.models import StudentWithProjector, StudentWithCosine, StudentWithInfoNCE, JointAssemblyStudent, StudentWithInBatchCosine, StudentWithInBatchInfoNCE, StudentWithJointInBatch
 import torch
 from tqdm import tqdm
-from src.utils.dataset import CosineDataset, InfoNCEDatasetWithLookup
+from src.utils.dataset import CosineDataset, InfoNCEDatasetWithLookup, InBatchInfoNCEDataset
 import numpy as np
 import random
 torch._functorch.config.donated_buffer = False
@@ -71,119 +71,255 @@ class JointDataCollator:
             
         return batch
 
+class SimpleInBatchCollator:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def __call__(self, features):
+        all_input_ids = []
+        all_attention_masks = []
+        all_teacher_embeddings = []
+        
+        for f in features:
+            if len(f["input_ids"]) > 0 and isinstance(f["input_ids"][0], list):
+                all_input_ids.extend(f["input_ids"])
+                all_attention_masks.extend(f["attention_mask"])
+            else:
+                all_input_ids.append(f["input_ids"])
+                all_attention_masks.append(f["attention_mask"])
+                
+            if "labels" in f:
+                if len(f["input_ids"]) > 0 and isinstance(f["input_ids"][0], list):
+                    all_teacher_embeddings.extend(f["labels"])
+                else:
+                    all_teacher_embeddings.append(f["labels"])
+            elif "teacher_embeddings" in f:
+                if len(f["input_ids"]) > 0 and isinstance(f["input_ids"][0], list):
+                    all_teacher_embeddings.extend(f["teacher_embeddings"])
+                else:
+                    all_teacher_embeddings.append(f["teacher_embeddings"])
+            
+        padded = self.tokenizer.pad(
+            {"input_ids": all_input_ids, "attention_mask": all_attention_masks},
+            padding=True,
+            return_tensors="pt"
+        )
+        
+        batch = {
+            "input_ids": padded["input_ids"],
+            "attention_mask": padded["attention_mask"],
+        }
+        
+        if all_teacher_embeddings:
+            batch["teacher_embeddings"] = torch.tensor(np.array(all_teacher_embeddings), dtype=torch.float32)
+            
+        return batch
+
+class InBatchInfoNCECollator:
+    def __init__(self, tokenizer, mlm_probability=0.0):
+        self.tokenizer = tokenizer
+        self.mlm_probability = mlm_probability
+        if mlm_probability > 0:
+            self.mlm_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=True, mlm_probability=mlm_probability)
+
+    def __call__(self, features):
+        all_input_ids = []
+        all_attention_masks = []
+        all_binary_names = []
+        all_function_names = []
+        anchor_teacher_embeddings = []
+        positive_teacher_embeddings = []
+
+        # We first grab all anchors, then all positives
+        for feature in features:
+            all_input_ids.append(feature["anchor_input_ids"])
+            all_attention_masks.append(feature["anchor_attention_mask"])
+            all_binary_names.append(feature["anchor_binary_name"])
+            all_function_names.append(feature["anchor_function_name"])
+            if "anchor_teacher_embedding" in feature:
+                anchor_teacher_embeddings.append(feature["anchor_teacher_embedding"])
+
+        for feature in features:
+            all_input_ids.append(feature["positive_input_ids"])
+            all_attention_masks.append(feature["positive_attention_mask"])
+            all_binary_names.append(feature["positive_binary_name"])
+            all_function_names.append(feature["positive_function_name"])
+            if "positive_teacher_embedding" in feature:
+                positive_teacher_embeddings.append(feature["positive_teacher_embedding"])
+            
+        padded = self.tokenizer.pad(
+            {"input_ids": all_input_ids, "attention_mask": all_attention_masks},
+            padding=True,
+            return_tensors="pt"
+        )
+        
+        batch = {
+            "input_ids": padded["input_ids"],
+            "attention_mask": padded["attention_mask"],
+            "binary_names": all_binary_names,
+            "function_names": all_function_names
+        }
+        
+        if self.mlm_probability > 0:
+            clean_input_ids = padded["input_ids"].clone()
+            masked_input_ids, mlm_labels = self.mlm_collator.torch_mask_tokens(padded["input_ids"])
+            batch["input_ids"] = clean_input_ids
+            batch["masked_input_ids"] = masked_input_ids
+            batch["mlm_labels"] = mlm_labels
+        
+        if anchor_teacher_embeddings and positive_teacher_embeddings:
+            batch["teacher_embeddings"] = torch.tensor(anchor_teacher_embeddings + positive_teacher_embeddings, dtype=torch.float32)
+
+        return batch
+
 class JointTrainer(Trainer):
-    def __init__(self, *args, ol_aux_beta=0.001, ol_aux_horizon=10, use_ol_aux=False, **kwargs):
+    def __init__(self, *args, ol_aux_beta=0.001, ol_aux_horizon=10, use_ol_aux=False, ol_aux_strict_paper=False, nce_start_step=0, **kwargs):
         super().__init__(*args, **kwargs)
         self.ol_aux_beta = ol_aux_beta
         self.ol_aux_horizon = ol_aux_horizon
         self.use_ol_aux = use_ol_aux
+        self.ol_aux_strict_paper = ol_aux_strict_paper
+        self.nce_start_step = nce_start_step
         
         # Accumulators for dot products
         self.dot_mlm_acc = 0.0
         self.dot_distill_acc = 0.0
         self.step_counter = 0
 
+        # Gradient Magnitude Balancers
+        self.scale_mlm = 1.0
+        self.scale_distill = 1.0
+
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # 1. Safely unwrap the model for Multi-GPU compatibility
+        actual_model = self.model.module if hasattr(self.model, "module") else self.model
+
         if not self.use_ol_aux:
-            # Fallback to standard logic if OL-AUX is disabled
             outputs = model(**inputs, use_ol_aux=self.use_ol_aux)
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-            
             if self.model.training and isinstance(outputs, dict):
-                # Log components and fixed weights
                 logs = {f"train/{k}": v.item() for k, v in outputs.items() if "loss" in k or "w_" in k}
                 self.log(logs)
-                
             return (loss, outputs) if return_outputs else loss
+
         # ------------------------------------------
-        # 1. SINGLE FORWARD PASS (use_ol_aux=True immediately)
+        # 1. SINGLE FORWARD PASS 
         # ------------------------------------------
         outputs = model(**inputs, use_ol_aux=True) 
         L_main = outputs["nce_loss"]
         L_mlm = outputs["mlm_loss"]
         L_distill = outputs["distill_loss"]
 
+        # Curriculum: disable InfoNCE before nce_start_step
+        nce_active = (self.step_counter >= self.nce_start_step)
+
         # ------------------------------------------
-        # 2. ISOLATED PROXY GRADIENTS (Via Autograd)
+        # 2. ISOLATED PROXY GRADIENTS
         # ------------------------------------------
         if self.model.training:
             self.step_counter += 1
             
-            # SAMPLED HORIZON: Only compute proxy gradients on the Nth step
-            # This drastically reduces the overhead of OL-AUX, running near baseline speed
-            if self.step_counter % self.ol_aux_horizon == 0:
-                # We align gradients using the 'Meeting Point': 
-                # The last transformer layer and the projector
+            sampled_dot_mlm = 0.0
+            sampled_dot_distill = 0.0
+
+            # OL-AUX only runs when InfoNCE is active (no main task = no reference gradient)
+            if nce_active and (self.ol_aux_strict_paper or (self.step_counter % self.ol_aux_horizon == 0)):
                 proxy_params = []
-                if hasattr(model.student.bert.encoder, 'layer'):
-                    proxy_params.extend(list(model.student.bert.encoder.layer[-1].parameters()))
-                if model.projector is not None:
-                    proxy_params.extend(list(model.projector.parameters()))
+                if hasattr(actual_model.student.bert.encoder, 'layer'):
+                    proxy_params.extend(list(actual_model.student.bert.encoder.layer[-1].parameters()))
+                if actual_model.projector is not None:
+                    proxy_params.extend(list(actual_model.projector.parameters()))
                     
                 proxy_params = [p for p in proxy_params if p.requires_grad]
-                eps = 1e-8
                 
-                # Use autograd.grad instead of .backward()
-                # This prevents overwriting p.grad and preserves HF's Gradient Accumulation & AMP
                 def get_normalized_proxy_grad(loss_val):
                     grads = torch.autograd.grad(
-                        outputs=loss_val, # Removed torch.log to prevent NaN explosion
+                        outputs=loss_val, 
                         inputs=proxy_params, 
                         retain_graph=True, 
-                        allow_unused=True # Crucial: MLM doesn't use the projector
+                        allow_unused=True
                     )
-                    flat_grads = [torch.nan_to_num(g.contiguous().view(-1)) for g in grads if g is not None]
-                    if not flat_grads:
-                        return None
+                    flat_grads = []
+                    for g, p in zip(grads, proxy_params):
+                        if g is not None:
+                            flat_grads.append(torch.nan_to_num(g.contiguous().view(-1)))
+                        else:
+                            flat_grads.append(torch.zeros_like(p.contiguous().view(-1)))
                     
-                    # Combine and normalize to balance gradient magnitudes across tasks 
                     combined_grad = torch.cat(flat_grads)
                     norm = torch.norm(combined_grad)
                     if norm > 0:
-                        return combined_grad / norm
-                    return combined_grad
+                        return combined_grad / norm, norm
+                    return combined_grad, norm
 
-                # Calculate dot products silently
-                grad_main = get_normalized_proxy_grad(L_main)
+                grad_main, norm_main = get_normalized_proxy_grad(L_main)
                 
-                sampled_dot_mlm = 0.0
-                sampled_dot_distill = 0.0
-
                 if grad_main is not None:
                     if L_mlm > 0:
-                        grad_mlm = get_normalized_proxy_grad(L_mlm)
+                        grad_mlm, norm_mlm = get_normalized_proxy_grad(L_mlm)
                         if grad_mlm is not None:
                             sampled_dot_mlm = torch.nan_to_num(torch.dot(grad_main, grad_mlm)).item()
+                            if norm_mlm > 0:
+                                self.scale_mlm = torch.clamp(norm_main / norm_mlm, min=0.001, max=1000.0).item()
                     
                     if L_distill > 0:
-                        grad_distill = get_normalized_proxy_grad(L_distill)
+                        grad_distill, norm_distill = get_normalized_proxy_grad(L_distill)
                         if grad_distill is not None:
                             sampled_dot_distill = torch.nan_to_num(torch.dot(grad_main, grad_distill)).item()
+                            if norm_distill > 0:
+                                self.scale_distill = torch.clamp(norm_main / norm_distill, min=0.001, max=1000.0).item()
 
-                # ------------------------------------------
-                # 3. DYNAMIC WEIGHT UPDATE
-                # ------------------------------------------
+            if nce_active and self.ol_aux_strict_paper:
+                self.dot_mlm_acc += sampled_dot_mlm
+                self.dot_distill_acc += sampled_dot_distill
+
+            # ------------------------------------------
+            # 3. DYNAMIC WEIGHT UPDATE
+            # ------------------------------------------
+            if nce_active and (self.step_counter % self.ol_aux_horizon == 0):
                 with torch.no_grad():
-                    # OUT OF PLACE UPDATE to avoid modifying tensors needed by HF Trainer's backward pass
-                    new_w_mlm = model.w_mlm + (self.ol_aux_beta * sampled_dot_mlm)
-                    new_w_distill = model.w_distill + (self.ol_aux_beta * sampled_dot_distill)
+                    if self.ol_aux_strict_paper:
+                        new_w_mlm = actual_model.w_mlm + (self.ol_aux_beta * self.dot_mlm_acc)
+                        new_w_distill = actual_model.w_distill + (self.ol_aux_beta * self.dot_distill_acc)
+                        self.dot_mlm_acc = 0.0
+                        self.dot_distill_acc = 0.0
+                    else:
+                        new_w_mlm = actual_model.w_mlm + (self.ol_aux_beta * sampled_dot_mlm)
+                        new_w_distill = actual_model.w_distill + (self.ol_aux_beta * sampled_dot_distill)
                     
-                    # Clamp to ensure auxiliary tasks don't disappear completely or explode
-                    model.w_mlm.copy_(torch.clamp(new_w_mlm, min=0.01, max=5.0))
-                    model.w_distill.copy_(torch.clamp(new_w_distill, min=0.01, max=5.0))
+                    actual_model.w_mlm.copy_(torch.clamp(new_w_mlm, min=0.01, max=5.0))
+                    actual_model.w_distill.copy_(torch.clamp(new_w_distill, min=0.01, max=5.0))
 
-            # Log metrics
-            logs = {f"train/{k}": v.item() for k, v in outputs.items() if "loss" in k or "w_" in k}
+        # ------------------------------------------
+        # 4. FINAL COMPUTATION GRAPH & LOGGING
+        # ------------------------------------------
+        # GradNorm + OL-AUX: Explicit gradient magnitude balancing!
+        if nce_active:
+            total_loss = (actual_model.lambda_nce * L_main) + \
+                         (actual_model.w_mlm * self.scale_mlm * L_mlm) + \
+                         (actual_model.w_distill * self.scale_distill * L_distill)
+        else:
+            # Curriculum phase: only MLM + Distillation
+            total_loss = L_mlm + L_distill
+        
+        outputs["loss"] = total_loss
+        outputs["w_mlm"] = actual_model.w_mlm
+        outputs["w_distill"] = actual_model.w_distill
+        outputs["scale_mlm"] = torch.tensor(self.scale_mlm, device=total_loss.device)
+        outputs["scale_distill"] = torch.tensor(self.scale_distill, device=total_loss.device)
+        outputs["temperature"] = torch.tensor(actual_model.temperature, device=total_loss.device)
+        outputs["nce_active"] = torch.tensor(1.0 if nce_active else 0.0, device=total_loss.device)
+
+        # Logging happens AFTER outputs are correctly populated
+        if self.model.training:
+            logs = {f"train/{k}": v.item() for k, v in outputs.items() if "loss" in k or "w_" in k or "scale_" in k or k in ("temperature", "nce_active")}
             self.log(logs)
         else:
-            # Eval pass
             logs = {f"eval/{k}": v.item() for k, v in outputs.items() if "loss" in k}
             self.log(logs)
-
-        # Return the original total_loss so HF Trainer can do the actual model parameter backward pass
-        loss = outputs["loss"]
-        return (loss, outputs) if return_outputs else loss
+            
+        return (total_loss, outputs) if return_outputs else total_loss
 
 if __name__ == "__main__":
     set_seed(42)
@@ -202,6 +338,7 @@ if __name__ == "__main__":
     
     # Joint training arguments
     parser.add_argument("--lambda_mlm", type=float, default=1.0)
+    parser.add_argument("--use_cross_gpu_negatives", action='store_true', help="Use GatherLayer to fetch negatives from all GPUs for InfoNCE scaling.")
     parser.add_argument("--lambda_nce", type=float, default=1.0)
     parser.add_argument("--lambda_distill", type=float, default=1.0)
     parser.add_argument("--mlm_probability", type=float, default=0.15)
@@ -213,6 +350,9 @@ if __name__ == "__main__":
     parser.add_argument("--use_ol_aux", action='store_true', help="Use Online Learning for Auxiliary tasks (OL-AUX) to dynamically weight MLM and Distillation.")
     parser.add_argument("--ol_aux_beta", type=float, default=0.001, help="Learning rate for auxiliary task weights (w).")
     parser.add_argument("--ol_aux_horizon", type=int, default=10, help="Horizon (N) for gradient dot product accumulation.")
+    parser.add_argument("--ol_aux_strict_paper", action='store_true', help="Accumulate gradients every step as per the NeurIPS 2019 paper (slower but theoretically sound).")
+    parser.add_argument("--temperature_init", type=float, default=0.05, help="Fixed temperature for InfoNCE. Lower = sharper contrastive signal.")
+    parser.add_argument("--nce_start_step", type=int, default=0, help="Step at which to enable InfoNCE loss (curriculum learning). Before this step, only MLM+Distill train.")
 
     args = parser.parse_args()
     print(f'training on split {args.split} and method {args.method} and teacher {args.teacher_type} and max_len {args.max_len}')
@@ -378,18 +518,42 @@ if __name__ == "__main__":
             )
     
     elif 'cosine' in method or 'ft' in method or 'joint' in method:
-        split = method.split('_')
-        if len(split) > 1:
-            sampling = split[-1]
-            technique = split[0]
-        else:
-            technique = method
-            sampling = 'random'
+        if method == 'cosine_in_batch':
+            # drop unecessary columns
+            cols_to_remove = [c for c in ['function_names', 'function_name', 'binary_name'] if c in train_dataset.column_names]
+            if cols_to_remove:
+                train_dataset = train_dataset.remove_columns(cols_to_remove)
+            cols_to_remove_val = [c for c in ['function_names', 'function_name', 'binary_name'] if c in val_dataset.column_names]
+            if cols_to_remove_val:
+                val_dataset = val_dataset.remove_columns(cols_to_remove_val)
             
-        # drop unecessary columns
-        train_dataset = train_dataset.remove_columns(['function_names', 'binary_name'])
-        val_dataset = val_dataset.remove_columns(['function_names', 'binary_name'])
-        
+            model = StudentWithInBatchCosine(student_model, projector=projector_to_use)
+            custom_collate = SimpleInBatchCollator(tokenizer)
+            technique = 'cosine_in_batch'
+        elif method == 'ft_in_batch':
+            # We NEED binary_name and function_name for collision masking!
+            technique = 'ft_in_batch'
+            sampling = 'random' # uses the offline cosine_random_ft dataset
+        elif method == 'joint_in_batch':
+            technique = 'joint_in_batch'
+            sampling = 'random'
+        else:
+            split = method.split('_')
+            if len(split) > 1:
+                sampling = split[-1]
+                technique = split[0]
+            else:
+                technique = method
+                sampling = 'random'
+                
+            # drop unecessary columns
+            cols_to_remove = [c for c in ['function_names', 'function_name', 'binary_name'] if c in train_dataset.column_names]
+            if cols_to_remove:
+                train_dataset = train_dataset.remove_columns(cols_to_remove)
+            cols_to_remove_val = [c for c in ['function_names', 'function_name', 'binary_name'] if c in val_dataset.column_names]
+            if cols_to_remove_val:
+                val_dataset = val_dataset.remove_columns(cols_to_remove_val)
+            
         
         if technique == 'cosine':
             ### model
@@ -397,9 +561,16 @@ if __name__ == "__main__":
             dataset_name = f'cosine_{sampling}_kd'
 
         elif technique == 'ft':
-            ### dataset
             model = StudentWithInfoNCE(student_model, args.top_k, projector=projector_to_use)
             dataset_name = f'cosine_{sampling}_{technique}'
+            
+        elif technique == 'ft_in_batch':
+            model = StudentWithInBatchInfoNCE(student_model, projector=projector_to_use)
+            dataset_name = f'cosine_{sampling}_ft'
+            
+        elif technique == 'joint_in_batch':
+            model = StudentWithJointInBatch(student_model, projector=projector_to_use, lambda_nce=args.lambda_nce, lambda_distill=args.lambda_distill, lambda_mlm=args.lambda_mlm, use_cross_gpu_negatives=args.use_cross_gpu_negatives)
+            dataset_name = f'cosine_{sampling}_ft'
         
         elif technique == 'joint':
             ### model
@@ -410,19 +581,21 @@ if __name__ == "__main__":
                 lambda_mlm=args.lambda_mlm,
                 lambda_nce=args.lambda_nce,
                 lambda_distill=args.lambda_distill,
-                distill_loss_type=args.distill_loss_type
+                distill_loss_type=args.distill_loss_type,
+                temperature_init=args.temperature_init
             )
             # Joint training typically uses the KD dataset which has teacher scores
             dataset_name = f'cosine_{sampling}_kd'
 
-        # load cosine dataset
-        dataset = load_from_disk(os.path.join(data_dir, f'{dataset_name}', f'cross_{args.split}_split'))
- 
-        # split data
-        train_cache_cosine_path = os.path.join(cache_dir, f'{dataset_name}_filter', f"{args.split}_train.arrow")
-        val_cache_cosine_path = os.path.join(cache_dir, f'{dataset_name}_filter', f"{args.split}_val.arrow")
-        train_cosine_dataset = dataset.filter(lambda batch: [uid in train_ids for uid in batch["unique_id"]], batched=True, num_proc=32, cache_file_name=train_cache_cosine_path, desc='filter dataset with keys')
-        val_cosine_dataset = dataset.filter(lambda batch: [uid in val_ids for uid in batch["unique_id"]], batched=True, num_proc=32, cache_file_name=val_cache_cosine_path, desc='filter dataset with keys')
+        if technique != 'cosine_in_batch':
+            # load cosine dataset
+            dataset = load_from_disk(os.path.join(data_dir, f'{dataset_name}', f'cross_{args.split}_split'))
+     
+            # split data
+            train_cache_cosine_path = os.path.join(cache_dir, f'{dataset_name}_filter', f"{args.split}_train.arrow")
+            val_cache_cosine_path = os.path.join(cache_dir, f'{dataset_name}_filter', f"{args.split}_val.arrow")
+            train_cosine_dataset = dataset.filter(lambda batch: [uid in train_ids for uid in batch["unique_id"]], batched=True, num_proc=32, cache_file_name=train_cache_cosine_path, desc='filter dataset with keys')
+            val_cosine_dataset = dataset.filter(lambda batch: [uid in val_ids for uid in batch["unique_id"]], batched=True, num_proc=32, cache_file_name=val_cache_cosine_path, desc='filter dataset with keys')
 
         if technique == 'cosine' or technique == 'joint':
             ### build lookup table
@@ -464,7 +637,7 @@ if __name__ == "__main__":
             if technique == 'joint':
                 custom_collate = JointDataCollator(tokenizer, mlm_probability=args.mlm_probability)
 
-        elif technique == 'ft':
+        elif 'ft' in technique:
             train_cosine_dataset.set_format("numpy", columns=["unique_id", "positive_ids", "negative_ids"])
             val_cosine_dataset.set_format("numpy", columns=["unique_id", "positive_ids", "negative_ids"])
 
@@ -510,11 +683,15 @@ if __name__ == "__main__":
             train_id2idx = {uid: i for i, uid in tqdm(enumerate(final_train_uids), total=len(final_train_uids), desc="Building train id2idx")}
             val_id2idx = {uid: i for i, uid in tqdm(enumerate(final_val_uids), total=len(final_val_uids), desc="Building val id2idx")}
 
-            train_dataset = InfoNCEDatasetWithLookup(train_dataset, train_cosine_lookup, train_id2idx, top_k=args.top_k)
-            val_dataset = InfoNCEDatasetWithLookup(val_dataset, val_cosine_lookup, val_id2idx, top_k=args.top_k)
+            if technique == 'ft':
+                train_dataset = InfoNCEDatasetWithLookup(train_dataset, train_cosine_lookup, train_id2idx, top_k=args.top_k)
+                val_dataset = InfoNCEDatasetWithLookup(val_dataset, val_cosine_lookup, val_id2idx, top_k=args.top_k)
+            elif technique == 'ft_in_batch' or technique == 'joint_in_batch':
+                train_dataset = InBatchInfoNCEDataset(train_dataset, train_cosine_lookup, train_id2idx)
+                val_dataset = InBatchInfoNCEDataset(val_dataset, val_cosine_lookup, val_id2idx)
 
 
-        if technique != 'joint':
+        if technique != 'joint' and technique != 'cosine_in_batch' and technique != 'ft_in_batch' and technique != 'joint_in_batch':
             def custom_collate(features):
                 all_input_ids = []
                 all_attention_masks = []
@@ -538,6 +715,11 @@ if __name__ == "__main__":
                 padded_batch['labels'] = batch_labels
 
                 return padded_batch
+        
+        elif technique == 'ft_in_batch':
+            custom_collate = InBatchInfoNCECollator(tokenizer)
+        elif technique == 'joint_in_batch':
+            custom_collate = InBatchInfoNCECollator(tokenizer, mlm_probability=args.mlm_probability)
         
 
 
@@ -564,10 +746,21 @@ if __name__ == "__main__":
         init_suffix = ""
         
     ol_aux_details = ""
-    if technique == 'joint' and args.use_ol_aux:
-        ol_aux_details = f"_olaux_b{args.ol_aux_beta}_h{args.ol_aux_horizon}"
+    lambda_details = ""
+    if technique == 'joint':
+        if args.use_ol_aux:
+            ol_aux_details = f"_olaux_b{args.ol_aux_beta}_h{args.ol_aux_horizon}"
+            if args.ol_aux_strict_paper:
+                ol_aux_details += "_strict"
+        else:
+            if args.lambda_mlm != 1.0 or args.lambda_distill != 1.0 or args.lambda_nce != 1.0:
+                lambda_details = f"_m{args.lambda_mlm}_d{args.lambda_distill}_n{args.lambda_nce}"
+            
+    nce_details = ""
+    if args.nce_start_step > 0:
+        nce_details = f"_ncestart{args.nce_start_step}"
         
-    run_name += f'_{args.max_len}' + finetuning_details + init_suffix + ol_aux_details
+    run_name += f'_{args.max_len}' + finetuning_details + init_suffix + ol_aux_details + lambda_details + nce_details
     print(f'run name: {run_name}')
     wandb.init(
         project=project_name,
@@ -577,10 +770,20 @@ if __name__ == "__main__":
 
 
     # output dir
-    output_dir_name = f'{method}_{args.max_len}{finetuning_details}{init_suffix}{ol_aux_details}'
+    output_dir_name = f'{method}_{args.max_len}{finetuning_details}{init_suffix}{ol_aux_details}{lambda_details}{nce_details}'
     output_dir = os.path.join(output_dir, f"bert_{args.split}", teacher_type, output_dir_name)
     print(f'output dir: {output_dir}')
     os.makedirs(output_dir, exist_ok=True)
+
+    # Determine label names for evaluation loss calculation
+    if technique == 'cosine_in_batch':
+        label_names = ['teacher_embeddings']
+    elif technique == 'ft_in_batch':
+        label_names = ['binary_names']
+    elif technique == 'joint_in_batch':
+        label_names = ['binary_names', 'teacher_embeddings']
+    else:
+        label_names = None
 
     # training args
     training_args = TrainingArguments(
@@ -610,6 +813,7 @@ if __name__ == "__main__":
         dataloader_pin_memory=True,
         dataloader_prefetch_factor=2,
         torch_compile=True,
+        label_names=label_names,
     )
 
     # Trainer
@@ -623,7 +827,9 @@ if __name__ == "__main__":
             data_collator=custom_collate,
             use_ol_aux=args.use_ol_aux,
             ol_aux_beta=args.ol_aux_beta,
-            ol_aux_horizon=args.ol_aux_horizon
+            ol_aux_horizon=args.ol_aux_horizon,
+            ol_aux_strict_paper=args.ol_aux_strict_paper,
+            nce_start_step=args.nce_start_step
         )
     else:
         trainer = Trainer(
@@ -643,5 +849,8 @@ if __name__ == "__main__":
 
     if hasattr(model, 'projector') and model.projector is not None:
         torch.save(model.projector.state_dict(), os.path.join(output_dir, 'projector.pth'))
+
+    # Save the full wrapper to preserve temperature and OL-AUX weights
+    torch.save(model.state_dict(), os.path.join(output_dir, 'joint_wrapper.pth'))
 
     print('training complete')
