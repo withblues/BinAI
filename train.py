@@ -199,7 +199,7 @@ class JointTrainer(Trainer):
             outputs = model(**inputs, use_ol_aux=self.use_ol_aux)
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
             if self.model.training and isinstance(outputs, dict):
-                logs = {f"train/{k}": v.item() for k, v in outputs.items() if "loss" in k or "w_" in k}
+                logs = logs = {f"train/{k}": (v.item() if hasattr(v, 'item') else v) for k, v in outputs.items() if "loss" in k or "w_" in k}
                 self.log(logs)
             return (loss, outputs) if return_outputs else loss
 
@@ -637,7 +637,7 @@ if __name__ == "__main__":
             if technique == 'joint':
                 custom_collate = JointDataCollator(tokenizer, mlm_probability=args.mlm_probability)
 
-        elif 'ft' in technique:
+        elif 'ft' in technique or technique == 'joint_in_batch':
             train_cosine_dataset.set_format("numpy", columns=["unique_id", "positive_ids", "negative_ids"])
             val_cosine_dataset.set_format("numpy", columns=["unique_id", "positive_ids", "negative_ids"])
 
@@ -788,11 +788,11 @@ if __name__ == "__main__":
     # training args
     training_args = TrainingArguments(
         output_dir=output_dir,
-        overwrite_output_dir=True,
+        #overwrite_output_dir=True,
         save_strategy="steps",
-        save_steps=0.20,
+        save_steps=0.2,
         eval_strategy='steps',
-        eval_steps=0.20,
+        eval_steps=0.2,
         per_device_train_batch_size=128,
         per_device_eval_batch_size=128,
         gradient_accumulation_steps=1,
@@ -817,13 +817,13 @@ if __name__ == "__main__":
     )
 
     # Trainer
-    if technique == 'joint':
+    if technique == 'joint' or technique == 'joint_in_batch':
         trainer = JointTrainer(
             model=model,
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=val_dataset,
-            tokenizer=tokenizer,
+            processing_class=tokenizer,
             data_collator=custom_collate,
             use_ol_aux=args.use_ol_aux,
             ol_aux_beta=args.ol_aux_beta,
@@ -837,7 +837,7 @@ if __name__ == "__main__":
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=val_dataset,
-            tokenizer=tokenizer,
+            processing_class=tokenizer,
             data_collator=custom_collate,
         )
 
