@@ -439,6 +439,9 @@ class StudentWithJointInBatch(nn.Module):
         self.lambda_distill = lambda_distill
         self.lambda_mlm = lambda_mlm
         
+        self.register_buffer('w_mlm', torch.tensor(lambda_mlm, dtype=torch.float32))
+        self.register_buffer('w_distill', torch.tensor(lambda_distill, dtype=torch.float32))
+        
         self.infonce_criterion = nn.CrossEntropyLoss()
         self.distill_criterion = nn.MSELoss()
 
