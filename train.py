@@ -344,7 +344,7 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_distill", type=float, default=1.0)
     parser.add_argument("--mlm_probability", type=float, default=0.15)
     parser.add_argument("--top_k", type=int, default=10, help="Number of targets per anchor for InfoNCE/Joint")
-    parser.add_argument("--distill_loss_type", type=str, default='mse', choices=['mse', 'cosine', 'kl'], help="Loss function for similarity distillation in joint training.")
+    parser.add_argument("--distill_loss_type", type=str, default='mse', choices=['mse', 'cosine', 'kl', 'kl_retrieval'], help="Loss function for similarity distillation in joint training.")
     parser.add_argument("--max_steps", type=int, default=-1, help="If > 0, set total number of training steps to perform. Overrides num_train_epochs.")
 
     # OL-AUX arguments
@@ -353,6 +353,7 @@ if __name__ == "__main__":
     parser.add_argument("--ol_aux_horizon", type=int, default=10, help="Horizon (N) for gradient dot product accumulation.")
     parser.add_argument("--ol_aux_strict_paper", action='store_true', help="Accumulate gradients every step as per the NeurIPS 2019 paper (slower but theoretically sound).")
     parser.add_argument("--temperature_init", type=float, default=0.05, help="Fixed temperature for InfoNCE. Lower = sharper contrastive signal.")
+    parser.add_argument("--distill_temperature", type=float, default=2.0, help="Temperature for KL distillation. Typically much higher than InfoNCE (e.g. 2.0).")
     parser.add_argument("--nce_start_step", type=int, default=0, help="Step at which to enable InfoNCE loss (curriculum learning). Before this step, only MLM+Distill train.")
 
     args = parser.parse_args()
@@ -520,15 +521,7 @@ if __name__ == "__main__":
     
     elif 'cosine' in method or 'ft' in method or 'joint' in method:
         if method == 'cosine_in_batch':
-            # drop unecessary columns
-            cols_to_remove = [c for c in ['function_names', 'function_name', 'binary_name'] if c in train_dataset.column_names]
-            if cols_to_remove:
-                train_dataset = train_dataset.remove_columns(cols_to_remove)
-            cols_to_remove_val = [c for c in ['function_names', 'function_name', 'binary_name'] if c in val_dataset.column_names]
-            if cols_to_remove_val:
-                val_dataset = val_dataset.remove_columns(cols_to_remove_val)
-            
-            model = StudentWithInBatchCosine(student_model, projector=projector_to_use, distill_loss_type=args.distill_loss_type, temperature=args.temperature_init)
+            model = StudentWithInBatchCosine(student_model, projector=projector_to_use, distill_loss_type=args.distill_loss_type, temperature=args.temperature_init, distill_temperature=args.distill_temperature)
             custom_collate = SimpleInBatchCollator(tokenizer)
             technique = 'cosine_in_batch'
         elif method == 'ft_in_batch':
@@ -570,7 +563,7 @@ if __name__ == "__main__":
             dataset_name = f'cosine_{sampling}_ft'
             
         elif technique == 'joint_in_batch':
-            model = StudentWithJointInBatch(student_model, projector=projector_to_use, lambda_nce=args.lambda_nce, lambda_distill=args.lambda_distill, lambda_mlm=args.lambda_mlm, use_cross_gpu_negatives=args.use_cross_gpu_negatives, distill_loss_type=args.distill_loss_type)
+            model = StudentWithJointInBatch(student_model, projector=projector_to_use, lambda_nce=args.lambda_nce, lambda_distill=args.lambda_distill, lambda_mlm=args.lambda_mlm, distill_loss_type=args.distill_loss_type, temperature=args.temperature_init, distill_temperature=args.distill_temperature)
             dataset_name = f'cosine_{sampling}_ft'
         
         elif technique == 'joint':
