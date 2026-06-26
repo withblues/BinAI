@@ -199,7 +199,7 @@ class JointTrainer(Trainer):
             outputs = model(**inputs, use_ol_aux=self.use_ol_aux)
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
             if self.model.training and isinstance(outputs, dict):
-                logs = logs = {f"train/{k}": (v.item() if hasattr(v, 'item') else v) for k, v in outputs.items() if "loss" in k or "w_" in k}
+                logs = {f"train/{k}": (v.item() if hasattr(v, 'item') else v) for k, v in outputs.items() if "loss" in k or "w_" in k}
                 self.log(logs)
             return (loss, outputs) if return_outputs else loss
 
@@ -344,7 +344,7 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_distill", type=float, default=1.0)
     parser.add_argument("--mlm_probability", type=float, default=0.15)
     parser.add_argument("--top_k", type=int, default=10, help="Number of targets per anchor for InfoNCE/Joint")
-    parser.add_argument("--distill_loss_type", type=str, default='mse', choices=['mse', 'cosine'], help="Loss function for similarity distillation in joint training.")
+    parser.add_argument("--distill_loss_type", type=str, default='mse', choices=['mse', 'cosine', 'kl'], help="Loss function for similarity distillation in joint training.")
     parser.add_argument("--max_steps", type=int, default=-1, help="If > 0, set total number of training steps to perform. Overrides num_train_epochs.")
 
     # OL-AUX arguments
@@ -528,7 +528,7 @@ if __name__ == "__main__":
             if cols_to_remove_val:
                 val_dataset = val_dataset.remove_columns(cols_to_remove_val)
             
-            model = StudentWithInBatchCosine(student_model, projector=projector_to_use)
+            model = StudentWithInBatchCosine(student_model, projector=projector_to_use, distill_loss_type=args.distill_loss_type, temperature=args.temperature_init)
             custom_collate = SimpleInBatchCollator(tokenizer)
             technique = 'cosine_in_batch'
         elif method == 'ft_in_batch':
@@ -570,7 +570,7 @@ if __name__ == "__main__":
             dataset_name = f'cosine_{sampling}_ft'
             
         elif technique == 'joint_in_batch':
-            model = StudentWithJointInBatch(student_model, projector=projector_to_use, lambda_nce=args.lambda_nce, lambda_distill=args.lambda_distill, lambda_mlm=args.lambda_mlm, use_cross_gpu_negatives=args.use_cross_gpu_negatives)
+            model = StudentWithJointInBatch(student_model, projector=projector_to_use, lambda_nce=args.lambda_nce, lambda_distill=args.lambda_distill, lambda_mlm=args.lambda_mlm, use_cross_gpu_negatives=args.use_cross_gpu_negatives, distill_loss_type=args.distill_loss_type)
             dataset_name = f'cosine_{sampling}_ft'
         
         elif technique == 'joint':
@@ -764,7 +764,11 @@ if __name__ == "__main__":
     if args.nce_start_step > 0:
         nce_details = f"_ncestart{args.nce_start_step}"
         
-    run_name += f'_{args.max_len}' + finetuning_details + init_suffix + ol_aux_details + lambda_details + nce_details
+    distill_type_details = ""
+    if args.distill_loss_type != 'mse' and (technique == 'joint' or technique == 'joint_in_batch' or technique == 'cosine_in_batch'):
+        distill_type_details = f"_{args.distill_loss_type}"
+        
+    run_name += f'_{args.max_len}' + finetuning_details + init_suffix + ol_aux_details + lambda_details + nce_details + distill_type_details
     print(f'run name: {run_name}')
     wandb.init(
         project=project_name,
@@ -774,7 +778,7 @@ if __name__ == "__main__":
 
 
     # output dir
-    output_dir_name = f'{method}_{args.max_len}{finetuning_details}{init_suffix}{ol_aux_details}{lambda_details}{nce_details}'
+    output_dir_name = f'{method}_{args.max_len}{finetuning_details}{init_suffix}{ol_aux_details}{lambda_details}{nce_details}{distill_type_details}'
     output_dir = os.path.join(output_dir, f"bert_{args.split}", teacher_type, output_dir_name)
     print(f'output dir: {output_dir}')
     os.makedirs(output_dir, exist_ok=True)

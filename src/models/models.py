@@ -312,10 +312,12 @@ class JointAssemblyStudent(nn.Module):
         }
 
 class StudentWithInBatchCosine(nn.Module):
-    def __init__(self, student_model, projector=None):
+    def __init__(self, student_model, projector=None, distill_loss_type='mse', temperature=0.05):
         super().__init__()
         self.student = student_model
         self.projector = projector
+        self.distill_loss_type = distill_loss_type
+        self.temperature = temperature
         self.criterion = nn.MSELoss()
 
     def forward(self, input_ids, attention_mask=None, teacher_embeddings=None, **kwargs):
@@ -345,7 +347,17 @@ class StudentWithInBatchCosine(nn.Module):
             student_sims = torch.matmul(student_embeddings, student_embeddings.T)
             teacher_sims = torch.matmul(teacher_embeddings, teacher_embeddings.T)
 
-            loss = self.criterion(student_sims, teacher_sims)
+            if self.distill_loss_type == 'kl':
+                teacher_logits = teacher_sims / self.temperature
+                student_logits = student_sims / self.temperature
+                
+                teacher_probs = F.softmax(teacher_logits, dim=-1)
+                student_log_probs = F.log_softmax(student_logits, dim=-1)
+                
+                loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean')
+            else:
+                loss = self.criterion(student_sims, teacher_sims)
+                
             predicted_scores = student_sims
 
         return {
@@ -428,7 +440,7 @@ class StudentWithInBatchInfoNCE(nn.Module):
         }
 
 class StudentWithJointInBatch(nn.Module):
-    def __init__(self, student_model, projector=None, temperature=0.05, lambda_nce=1.0, lambda_distill=1.0, lambda_mlm=1.0, use_cross_gpu_negatives=False):
+    def __init__(self, student_model, projector=None, temperature=0.05, lambda_nce=1.0, lambda_distill=1.0, lambda_mlm=1.0, use_cross_gpu_negatives=False, distill_loss_type='mse'):
         super().__init__()
         self.student = student_model
         self.projector = projector
@@ -438,6 +450,7 @@ class StudentWithJointInBatch(nn.Module):
         self.lambda_nce = lambda_nce
         self.lambda_distill = lambda_distill
         self.lambda_mlm = lambda_mlm
+        self.distill_loss_type = distill_loss_type
         
         self.register_buffer('w_mlm', torch.tensor(lambda_mlm, dtype=torch.float32))
         self.register_buffer('w_distill', torch.tensor(lambda_distill, dtype=torch.float32))
@@ -584,9 +597,16 @@ class StudentWithJointInBatch(nn.Module):
                 student_sims_unscaled = torch.matmul(student_embeddings, global_student_embeddings.T)
             else:
                 teacher_sims = torch.matmul(teacher_embeddings, teacher_embeddings.T)
-                student_sims_unscaled = torch.matmul(student_embeddings, student_embeddings.T)
+            if getattr(self, 'distill_loss_type', 'mse') == 'kl':
+                teacher_logits = teacher_sims / self.temperature
+                student_logits = student_sims_unscaled / self.temperature
                 
-            distill_loss = self.distill_criterion(student_sims_unscaled, teacher_sims)
+                teacher_probs = F.softmax(teacher_logits, dim=-1)
+                student_log_probs = F.log_softmax(student_logits, dim=-1)
+                
+                distill_loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean')
+            else:
+                distill_loss = self.distill_criterion(student_sims_unscaled, teacher_sims)
             
             # --- Total Loss ---
             total_loss = (self.lambda_nce * nce_loss) + (self.lambda_distill * distill_loss) + (self.lambda_mlm * mlm_loss)
