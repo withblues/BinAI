@@ -557,16 +557,17 @@ class StudentWithJointInBatch(nn.Module):
             
             distill_type = getattr(self, 'distill_loss_type', 'mse')
             if distill_type == 'kl_retrieval':
-                # Student logits use the ALREADY MASKED sim_matrix from InfoNCE!
-                student_logits = sim_matrix
+                # Use the unscaled similarities, but divide by the DISTILL temperature
+                student_logits = student_sims_unscaled / self.distill_temperature
+                teacher_logits = teacher_sims / self.distill_temperature
                 
-                # Apply the EXACT SAME masking to teacher_logits
-                # We use InfoNCE temperature here because we are matching InfoNCE probabilities directly
-                teacher_logits = teacher_sims / self.temperature
-                
+                # Apply the EXACT SAME masking as InfoNCE
                 diag_mask = torch.eye(total_b, dtype=torch.bool, device=teacher_logits.device)
                 teacher_logits.masked_fill_(diag_mask, -float('inf'))
+                student_logits.masked_fill_(diag_mask, -float('inf'))
+                
                 teacher_logits.masked_fill_(mask_out, -float('inf'))
+                student_logits.masked_fill_(mask_out, -float('inf'))
                 
                 teacher_probs = F.softmax(teacher_logits, dim=-1)
                 student_log_probs = F.log_softmax(student_logits, dim=-1)
