@@ -357,20 +357,6 @@ class StudentWithInBatchCosine(nn.Module):
                 teacher_logits.masked_fill_(diag_mask, -1e9)
                 student_logits.masked_fill_(diag_mask, -1e9)
                 
-                # Mask out collisions if names provided
-                if binary_names is not None and function_names is not None:
-                    bin_names = np.array(binary_names)
-                    func_names = np.array(function_names)
-                    
-                    same_bin = (bin_names[:, None] == bin_names[None, :])
-                    same_func = (func_names[:, None] == func_names[None, :])
-                    is_name_collision = torch.tensor(same_bin & same_func, device=student_logits.device)
-                    is_hash_collision = torch.all(input_ids[:, None, :] == input_ids[None, :, :], dim=-1)
-                    
-                    mask_out = is_name_collision | is_hash_collision
-                    teacher_logits.masked_fill_(mask_out, -1e9)
-                    student_logits.masked_fill_(mask_out, -1e9)
-                
                 teacher_probs = F.softmax(teacher_logits, dim=-1)
                 student_log_probs = F.log_softmax(student_logits, dim=-1)
                 
@@ -580,10 +566,6 @@ class StudentWithJointInBatch(nn.Module):
                 diag_mask = torch.eye(total_b, dtype=torch.bool, device=teacher_logits.device)
                 teacher_logits.masked_fill_(diag_mask, -1e9)
                 student_logits.masked_fill_(diag_mask, -1e9)
-                
-                # Apply InfoNCE false-negative collision masking
-                teacher_logits.masked_fill_(mask_out, -1e9)
-                student_logits.masked_fill_(mask_out, -1e9)
                 
                 teacher_probs = F.softmax(teacher_logits, dim=-1)
                 student_log_probs = F.log_softmax(student_logits, dim=-1)
