@@ -354,8 +354,8 @@ class StudentWithInBatchCosine(nn.Module):
                 
                 # Mask out diagonal (self-similarity)
                 diag_mask = torch.eye(student_logits.shape[0], dtype=torch.bool, device=student_logits.device)
-                teacher_logits.masked_fill_(diag_mask, -float('inf'))
-                student_logits.masked_fill_(diag_mask, -float('inf'))
+                teacher_logits.masked_fill_(diag_mask, -1e9)
+                student_logits.masked_fill_(diag_mask, -1e9)
                 
                 # Mask out collisions if names provided
                 if binary_names is not None and function_names is not None:
@@ -368,13 +368,13 @@ class StudentWithInBatchCosine(nn.Module):
                     is_hash_collision = torch.all(input_ids[:, None, :] == input_ids[None, :, :], dim=-1)
                     
                     mask_out = is_name_collision | is_hash_collision
-                    teacher_logits.masked_fill_(mask_out, -float('inf'))
-                    student_logits.masked_fill_(mask_out, -float('inf'))
+                    teacher_logits.masked_fill_(mask_out, -1e9)
+                    student_logits.masked_fill_(mask_out, -1e9)
                 
                 teacher_probs = F.softmax(teacher_logits, dim=-1)
                 student_log_probs = F.log_softmax(student_logits, dim=-1)
                 
-                loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean')
+                loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean') * (self.distill_temperature ** 2)
             else:
                 loss = self.criterion(student_sims, teacher_sims)
                 
@@ -443,14 +443,14 @@ class StudentWithInBatchInfoNCE(nn.Module):
             targets[B:] = torch.arange(0, B, device=sim_matrix.device)
             
             # We mask out the diagonal (cannot be target for itself)
-            sim_matrix.fill_diagonal_(-float('inf'))
+            sim_matrix.fill_diagonal_(-1e9)
             
             # Mask out collisions (false negatives)
             is_explicit_target = torch.zeros_like(is_collision, dtype=torch.bool)
             is_explicit_target[torch.arange(total_b), targets] = True
             
             mask_out = is_collision & ~is_explicit_target
-            sim_matrix.masked_fill_(mask_out, -float('inf'))
+            sim_matrix.masked_fill_(mask_out, -1e9)
 
             loss = self.criterion(sim_matrix, targets)
 
@@ -540,13 +540,13 @@ class StudentWithJointInBatch(nn.Module):
             targets[:B] = torch.arange(B, total_b, device=sim_matrix.device)
             targets[B:] = torch.arange(0, B, device=sim_matrix.device)
             
-            sim_matrix.fill_diagonal_(-float('inf'))
+            sim_matrix.fill_diagonal_(-1e9)
             
             is_explicit_target = torch.zeros_like(is_collision, dtype=torch.bool)
             is_explicit_target[torch.arange(total_b), targets] = True
             
             mask_out = is_collision & ~is_explicit_target
-            sim_matrix.masked_fill_(mask_out, -float('inf'))
+            sim_matrix.masked_fill_(mask_out, -1e9)
 
             nce_loss = self.infonce_criterion(sim_matrix, targets)
             predicted_scores = sim_matrix
@@ -563,32 +563,32 @@ class StudentWithJointInBatch(nn.Module):
                 
                 # Apply the EXACT SAME masking as InfoNCE
                 diag_mask = torch.eye(total_b, dtype=torch.bool, device=teacher_logits.device)
-                teacher_logits.masked_fill_(diag_mask, -float('inf'))
-                student_logits.masked_fill_(diag_mask, -float('inf'))
+                teacher_logits.masked_fill_(diag_mask, -1e9)
+                student_logits.masked_fill_(diag_mask, -1e9)
                 
-                teacher_logits.masked_fill_(mask_out, -float('inf'))
-                student_logits.masked_fill_(mask_out, -float('inf'))
+                teacher_logits.masked_fill_(mask_out, -1e9)
+                student_logits.masked_fill_(mask_out, -1e9)
                 
                 teacher_probs = F.softmax(teacher_logits, dim=-1)
                 student_log_probs = F.log_softmax(student_logits, dim=-1)
                 
-                distill_loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean')
+                distill_loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean') * (self.distill_temperature ** 2)
             elif distill_type == 'kl':
                 teacher_logits = teacher_sims / self.distill_temperature
                 student_logits = student_sims_unscaled / self.distill_temperature
                 
                 diag_mask = torch.eye(total_b, dtype=torch.bool, device=teacher_logits.device)
-                teacher_logits.masked_fill_(diag_mask, -float('inf'))
-                student_logits.masked_fill_(diag_mask, -float('inf'))
+                teacher_logits.masked_fill_(diag_mask, -1e9)
+                student_logits.masked_fill_(diag_mask, -1e9)
                 
                 # Apply InfoNCE false-negative collision masking
-                teacher_logits.masked_fill_(mask_out, -float('inf'))
-                student_logits.masked_fill_(mask_out, -float('inf'))
+                teacher_logits.masked_fill_(mask_out, -1e9)
+                student_logits.masked_fill_(mask_out, -1e9)
                 
                 teacher_probs = F.softmax(teacher_logits, dim=-1)
                 student_log_probs = F.log_softmax(student_logits, dim=-1)
                 
-                distill_loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean')
+                distill_loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean') * (self.distill_temperature ** 2)
             else:
                 distill_loss = self.distill_criterion(student_sims_unscaled, teacher_sims)
             
