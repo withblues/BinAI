@@ -344,7 +344,7 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_distill", type=float, default=1.0)
     parser.add_argument("--mlm_probability", type=float, default=0.15)
     parser.add_argument("--top_k", type=int, default=10, help="Number of targets per anchor for InfoNCE/Joint")
-    parser.add_argument("--distill_loss_type", type=str, default='mse', choices=['mse', 'cosine', 'kl', 'kl_retrieval', 'listnet', 'listnet_retrieval'], help="Loss function for similarity distillation in joint training.")
+    parser.add_argument("--distill_loss_type", type=str, default='mse', choices=['mse', 'cosine', 'kl', 'kl_retrieval', 'topk_kl', 'topk_kl_retrieval', 'pairwiserank', 'pairwiserank_retrieval'], help="Loss function for similarity distillation in joint training.")
     
     # --- New option for OL-AUX dynamic weighting ---
     parser.add_argument("--use_ol_aux", action='store_true', help="Use Online Learning for Auxiliary tasks (OL-AUX) to dynamically weight MLM and Distillation.")
