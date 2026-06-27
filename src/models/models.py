@@ -374,7 +374,7 @@ class StudentWithInBatchCosine(nn.Module):
                 teacher_probs = F.softmax(teacher_logits, dim=-1)
                 student_log_probs = F.log_softmax(student_logits, dim=-1)
                 
-                loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean') * (self.distill_temperature ** 2)
+                loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean')
             else:
                 loss = self.criterion(student_sims, teacher_sims)
                 
@@ -572,7 +572,7 @@ class StudentWithJointInBatch(nn.Module):
                 teacher_probs = F.softmax(teacher_logits, dim=-1)
                 student_log_probs = F.log_softmax(student_logits, dim=-1)
                 
-                distill_loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean') * (self.distill_temperature ** 2)
+                distill_loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean')
             elif distill_type == 'kl':
                 teacher_logits = teacher_sims / self.distill_temperature
                 student_logits = student_sims_unscaled / self.distill_temperature
@@ -588,7 +588,7 @@ class StudentWithJointInBatch(nn.Module):
                 teacher_probs = F.softmax(teacher_logits, dim=-1)
                 student_log_probs = F.log_softmax(student_logits, dim=-1)
                 
-                distill_loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean') * (self.distill_temperature ** 2)
+                distill_loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean')
             else:
                 distill_loss = self.distill_criterion(student_sims_unscaled, teacher_sims)
             
