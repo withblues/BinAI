@@ -312,13 +312,14 @@ class JointAssemblyStudent(nn.Module):
         }
 
 class StudentWithInBatchCosine(nn.Module):
-    def __init__(self, student_model, projector=None, distill_loss_type='mse', temperature=0.05, distill_temperature=2.0):
+    def __init__(self, student_model, projector=None, distill_loss_type='mse', temperature=0.05, distill_temperature=2.0, distill_topk=32):
         super().__init__()
         self.student = student_model
         self.projector = projector
         self.distill_loss_type = distill_loss_type
         self.temperature = temperature
         self.distill_temperature = distill_temperature
+        self.distill_topk = distill_topk
         self.criterion = nn.MSELoss()
 
     def forward(self, input_ids, attention_mask=None, teacher_embeddings=None, binary_names=None, function_names=None, **kwargs):
@@ -359,6 +360,22 @@ class StudentWithInBatchCosine(nn.Module):
                 
                 teacher_probs = F.softmax(teacher_logits, dim=-1)
                 student_log_probs = F.log_softmax(student_logits, dim=-1)
+                
+                loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean')
+            elif self.distill_loss_type == 'listnet':
+                teacher_logits = teacher_sims / self.distill_temperature
+                student_logits = student_sims / self.distill_temperature
+                
+                diag_mask = torch.eye(student_logits.shape[0], dtype=torch.bool, device=student_logits.device)
+                teacher_logits.masked_fill_(diag_mask, -1e9)
+                student_logits.masked_fill_(diag_mask, -1e9)
+                
+                k = min(self.distill_topk, teacher_logits.size(-1))
+                topk_teacher_logits, topk_indices = torch.topk(teacher_logits, k, dim=-1)
+                topk_student_logits = torch.gather(student_logits, dim=-1, index=topk_indices)
+                
+                teacher_probs = F.softmax(topk_teacher_logits, dim=-1)
+                student_log_probs = F.log_softmax(topk_student_logits, dim=-1)
                 
                 loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean')
             else:
@@ -508,9 +525,14 @@ class StudentWithJointInBatch(nn.Module):
             total_b = student_embeddings.shape[0]
             B = total_b // 2
 
-            # --- InfoNCE Loss ---
+            teacher_embeddings = F.normalize(teacher_embeddings, p=2, dim=-1)
+            
             student_sims_unscaled = torch.matmul(student_embeddings, student_embeddings.T)
+            teacher_sims = torch.matmul(teacher_embeddings, teacher_embeddings.T)
+            
             sim_matrix = student_sims_unscaled / self.temperature
+            
+            total_b = sim_matrix.size(0)
             
             bin_names = np.array(binary_names)
             func_names = np.array(function_names)
@@ -519,10 +541,10 @@ class StudentWithJointInBatch(nn.Module):
             same_func = (func_names[:, None] == func_names[None, :])
             is_name_collision = torch.tensor(same_bin & same_func, device=sim_matrix.device)
             is_hash_collision = torch.all(input_ids[:, None, :] == input_ids[None, :, :], dim=-1)
-
+            
             is_collision = is_name_collision | is_hash_collision
-
-            targets = torch.empty(total_b, dtype=torch.long, device=sim_matrix.device)
+            
+            targets = torch.zeros(total_b, dtype=torch.long, device=sim_matrix.device)
             targets[:B] = torch.arange(B, total_b, device=sim_matrix.device)
             targets[B:] = torch.arange(0, B, device=sim_matrix.device)
             
@@ -536,18 +558,11 @@ class StudentWithJointInBatch(nn.Module):
 
             nce_loss = self.infonce_criterion(sim_matrix, targets)
             predicted_scores = sim_matrix
-
-            # --- Distillation Loss ---
-            teacher_embeddings = F.normalize(teacher_embeddings, p=2, dim=-1)
-            teacher_sims = torch.matmul(teacher_embeddings, teacher_embeddings.T)
             
-            distill_type = getattr(self, 'distill_loss_type', 'mse')
-            if distill_type == 'kl_retrieval':
-                # Use the unscaled similarities, but divide by the DISTILL temperature
+            if self.distill_loss_type == 'kl_retrieval':
                 student_logits = student_sims_unscaled / self.distill_temperature
                 teacher_logits = teacher_sims / self.distill_temperature
                 
-                # Apply the EXACT SAME masking as InfoNCE
                 diag_mask = torch.eye(total_b, dtype=torch.bool, device=teacher_logits.device)
                 teacher_logits.masked_fill_(diag_mask, -1e9)
                 student_logits.masked_fill_(diag_mask, -1e9)
@@ -559,7 +574,7 @@ class StudentWithJointInBatch(nn.Module):
                 student_log_probs = F.log_softmax(student_logits, dim=-1)
                 
                 distill_loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean')
-            elif distill_type == 'kl':
+            elif self.distill_loss_type == 'kl':
                 teacher_logits = teacher_sims / self.distill_temperature
                 student_logits = student_sims_unscaled / self.distill_temperature
                 
@@ -571,16 +586,35 @@ class StudentWithJointInBatch(nn.Module):
                 student_log_probs = F.log_softmax(student_logits, dim=-1)
                 
                 distill_loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean')
+            elif self.distill_loss_type in ['listnet', 'listnet_retrieval']:
+                teacher_logits = teacher_sims / self.distill_temperature
+                student_logits = student_sims_unscaled / self.distill_temperature
+                
+                diag_mask = torch.eye(total_b, dtype=torch.bool, device=teacher_logits.device)
+                teacher_logits.masked_fill_(diag_mask, -1e9)
+                student_logits.masked_fill_(diag_mask, -1e9)
+                
+                if self.distill_loss_type == 'listnet_retrieval':
+                    teacher_logits.masked_fill_(mask_out, -1e9)
+                    student_logits.masked_fill_(mask_out, -1e9)
+                    
+                k = min(self.distill_topk, teacher_logits.size(-1))
+                topk_teacher_logits, topk_indices = torch.topk(teacher_logits, k, dim=-1)
+                topk_student_logits = torch.gather(student_logits, dim=-1, index=topk_indices)
+                
+                teacher_probs = F.softmax(topk_teacher_logits, dim=-1)
+                student_log_probs = F.log_softmax(topk_student_logits, dim=-1)
+                
+                distill_loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean')
             else:
                 distill_loss = self.distill_criterion(student_sims_unscaled, teacher_sims)
             
-            # --- Total Loss ---
             total_loss = (self.lambda_nce * nce_loss) + (self.lambda_distill * distill_loss) + (self.lambda_mlm * mlm_loss)
 
         return {
             "loss": total_loss,
             "logits": predicted_scores,
             "nce_loss": nce_loss,
-            "distill_loss": distill_loss,
+            "distill_loss": distill_loss if teacher_embeddings is not None else None,
             "mlm_loss": mlm_loss
         }
