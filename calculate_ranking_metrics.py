@@ -195,6 +195,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", default=1024, type=int, help="Batch size for GPU queries. Tune based on VRAM.")
     parser.add_argument("--model_name", default='clap', help="Model name for student-teacher evaluation.")
     parser.add_argument("--embeddings_dataset_path", type=str, required=True, help="Path to the pre-computed embeddings dataset.")
+    parser.add_argument("--skip_teacher", action="store_true", help="Skip loading teacher embeddings and skip teacher comparison metrics.")
     args = parser.parse_args()
 
     # The method and init_suffix are now only for naming the output report
@@ -231,7 +232,7 @@ if __name__ == "__main__":
     print(f"Loaded {num_rows} embeddings of dimension {dim}.")
     test_ids_set = set(all_ids)
 
-    if IS_STUDENT_EVAL:
+    if IS_STUDENT_EVAL and not args.skip_teacher:
         print(f"Loading pre-computed teacher scores for {args.model_name}")
         teacher_matrix_path = os.path.join(args.output_dir, 'inference/cosine_scores', args.split, f"{args.model_name}_similarity_matrix.mmap")
         teacher_ids_path = os.path.join(args.output_dir, 'inference/cosine_scores', args.split, f"{args.model_name}_ids.npy")
@@ -336,13 +337,14 @@ if __name__ == "__main__":
         sim_scores_processed_gpu = sim_scores_gpu[mask].view(current_batch_size, num_rows - 1)
 
         if IS_STUDENT_EVAL:
-            # load teacher scores
-            sim_scores_teacher_cpu = teacher_similarity_mmap[batch_start:batch_end, :].copy() 
-            sim_scores_teacher_gpu = torch.from_numpy(sim_scores_teacher_cpu).to(device)
-            
-            # spearman
-            spearman_scores = spearman_corr_batch(sim_scores_processed_gpu, sim_scores_teacher_gpu)
-            metrics_results['spearman'].extend(spearman_scores.cpu().tolist())
+            if not args.skip_teacher:
+                # load teacher scores
+                sim_scores_teacher_cpu = teacher_similarity_mmap[batch_start:batch_end, :].copy() 
+                sim_scores_teacher_gpu = torch.from_numpy(sim_scores_teacher_cpu).to(device)
+                
+                # spearman
+                spearman_scores = spearman_corr_batch(sim_scores_processed_gpu, sim_scores_teacher_gpu)
+                metrics_results['spearman'].extend(spearman_scores.cpu().tolist())
         else: 
             # save to disk
             similarity_matrix_mmap[batch_start:batch_end, :] = sim_scores_processed_gpu.cpu().numpy()
@@ -363,7 +365,7 @@ if __name__ == "__main__":
         final_report['mrr'] = np.mean(metrics_results['mrr'])
         print(f"Teacher MRR: {final_report['mrr']:.4f}")
 
-        if IS_STUDENT_EVAL:
+        if IS_STUDENT_EVAL and not args.skip_teacher:
             final_report['spearman'] = np.mean(metrics_results['spearman'])
             print(f"Teacher spearman: {final_report['spearman']:.4f}")
 
