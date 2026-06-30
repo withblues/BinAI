@@ -349,7 +349,7 @@ if __name__ == "__main__":
     # --- New option for OL-AUX dynamic weighting ---
     parser.add_argument("--use_ol_aux", action='store_true', help="Use Online Learning for Auxiliary tasks (OL-AUX) to dynamically weight MLM and Distillation.")
     
-    parser.add_argument("--teacher_type", type=str, default='bert', choices=['bert', 'clap'], help="Which teacher architecture to load embeddings for (only for distillation approaches).")
+
     
     parser.add_argument("--temperature_init", type=float, default=0.07, help="Initial temperature for InfoNCE loss (if no scheduler is used, stays constant).")
     parser.add_argument("--distill_temperature", type=float, default=2.0, help="Temperature for KL distillation. Typically much higher than InfoNCE (e.g. 2.0).")
@@ -361,7 +361,10 @@ if __name__ == "__main__":
     parser.add_argument("--max_steps", type=int, default=-1, help="If > 0, set total number of training steps to perform. Overrides num_train_epochs.")
 
     args = parser.parse_args()
-    print(f'training on split {args.split} and method {args.method} and teacher {args.teacher_type} and max_len {args.max_len}')
+    # print all args
+    for arg in vars(args):
+        print(f"{arg}: {getattr(args, arg)}")
+
     method = args.method
     # dirs
     data_dir = args.data_dir
@@ -807,7 +810,7 @@ if __name__ == "__main__":
         learning_rate=1e-5,
         weight_decay=0.01,
         warmup_ratio=0.1,
-        tf32=True,
+        #tf32=True,
         report_to='wandb',
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
