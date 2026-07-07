@@ -334,6 +334,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_projector_in_ft", action='store_true', help="Use the projector from the checkpoint during finetuning.")
     parser.add_argument("--student_model_name_or_path", type=str, default=None, help="Path or HuggingFace ID of the student model to initialize. If None, defaults to the split specific MLM model.")
     parser.add_argument("--from_scratch", action='store_true', help="Initialize the student model with random weights using the default architecture instead of loading pretrained weights.")
+    parser.add_argument("--filter_truncated", action='store_true', help="Filter out any data that is equal to or exceeds max_len tokens.")
     parser.add_argument("--resume_from_checkpoint", action='store_true', help="Resume training from the last checkpoint in the output directory.")
     parser.add_argument("--batch_size", type=int, default=128, help="Per-device train and eval batch size.")
     
@@ -427,6 +428,14 @@ if __name__ == "__main__":
     val_cache_tokenization_path = os.path.join(cache_dir, 'tokenization', f"{args.split}_val.arrow")
     train_dataset = train_dataset.map(format_and_tokenize, batched=True, num_proc=os.cpu_count() // 2, remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=train_cache_tokenization_path)
     val_dataset = val_dataset.map(format_and_tokenize, batched=True, num_proc=os.cpu_count() // 2, remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=val_cache_tokenization_path)
+
+    if args.filter_truncated:
+        print(f'Len of train dataset before filtering: {len(train_dataset)}')
+        print(f'Len of val dataset before filtering: {len(val_dataset)}')
+        train_dataset = train_dataset.filter(lambda batch: [len(ids) < args.max_len for ids in batch["input_ids"]], batched=True, num_proc=16, desc="filtering truncated train data")
+        val_dataset = val_dataset.filter(lambda batch: [len(ids) < args.max_len for ids in batch["input_ids"]], batched=True, num_proc=16, desc="filtering truncated val data")
+        print(f'Len of train dataset after filtering: {len(train_dataset)}')
+        print(f'Len of val dataset after filtering: {len(val_dataset)}')
 
     ### model
     if args.from_scratch:
@@ -767,8 +776,9 @@ if __name__ == "__main__":
     distill_type_details = ""
     if args.distill_loss_type != 'mse' and (technique == 'joint' or technique == 'joint_in_batch' or technique == 'cosine_in_batch'):
         distill_type_details = f"_{args.distill_loss_type}"
+    filter_trunc_details = "_filter_trunc" if args.filter_truncated else ""
         
-    run_name += f'_{args.max_len}' + finetuning_details + init_suffix + ol_aux_details + lambda_details + nce_details + distill_type_details
+    run_name += f'_{args.max_len}' + filter_trunc_details + finetuning_details + init_suffix + ol_aux_details + lambda_details + nce_details + distill_type_details
     print(f'run name: {run_name}')
     wandb.init(
         project=project_name,

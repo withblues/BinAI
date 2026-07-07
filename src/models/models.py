@@ -305,10 +305,13 @@ class JointAssemblyStudent(nn.Module):
 
         return {
             "loss": total_loss,
+            "logits": student_scores,
             "nce_loss": nce_loss,
-            "mlm_loss": mlm_loss,
+            "nce_loss_scaled": self.lambda_nce * nce_loss,
             "distill_loss": distill_loss,
-            "logits": student_scores
+            "distill_loss_scaled": self.lambda_distill * distill_loss,
+            "mlm_loss": mlm_loss,
+            "mlm_loss_scaled": self.lambda_mlm * mlm_loss
         }
 
 class StudentWithInBatchCosine(nn.Module):
@@ -660,6 +663,9 @@ class StudentWithJointInBatch(nn.Module):
             "loss": total_loss,
             "logits": predicted_scores,
             "nce_loss": nce_loss,
+            "nce_loss_scaled": self.lambda_nce * nce_loss,
             "distill_loss": distill_loss if teacher_embeddings is not None else None,
-            "mlm_loss": mlm_loss
+            "distill_loss_scaled": self.lambda_distill * distill_loss if teacher_embeddings is not None else None,
+            "mlm_loss": mlm_loss,
+            "mlm_loss_scaled": self.lambda_mlm * mlm_loss
         }

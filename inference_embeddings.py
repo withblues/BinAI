@@ -99,6 +99,8 @@ if __name__ == "__main__":
     parser.add_argument("--is_teacher", action='store_true',)
     parser.add_argument("--checkpoint_dir", type=str, default=None, help="Path to checkpoint directory containing student.pth and optionally projector.pth.")
     parser.add_argument("--from_scratch", action='store_true', help="Initialize the student model with random weights using the default architecture instead of loading pretrained weights.")
+    parser.add_argument("--max_length", type=int, default=128, help="Max context length for the model")
+    parser.add_argument("--filter_truncated", action='store_true', help="Filter out any data that is equal to or exceeds student max_len tokens.")
     args = parser.parse_args()
 
     data_dir = args.data_dir
@@ -119,6 +121,22 @@ if __name__ == "__main__":
     test_cache_filter_path = os.path.join(cache_dir, 'dataset_filter', f"{args.split}_test.arrow")
     test_dataset = dataset.filter(lambda batch: [uid in test_ids for uid in batch["unique_id"]], batched=True, num_proc=16, cache_file_name=test_cache_filter_path)
 
+    if args.filter_truncated:
+        print("Filtering truncated examples based on student tokenization...")
+        student_tokenizer = BertTokenizerFast.from_pretrained(os.path.join(data_dir, "tokenizer"))
+        
+        def get_len_flag(examples):
+            texts = [
+                f"{student_tokenizer.cls_token} " + f" {student_tokenizer.sep_token} ".join(instr_list) + f" {student_tokenizer.sep_token}"
+                for instr_list in examples["instructions"]
+            ]
+            tokenized = student_tokenizer(texts, truncation=True, max_length=args.max_length)
+            return {"keep": [len(ids) < args.max_length for ids in tokenized["input_ids"]]}
+        
+        test_dataset = test_dataset.map(get_len_flag, batched=True, num_proc=16, desc="Checking lengths")
+        test_dataset = test_dataset.filter(lambda x: x["keep"], num_proc=16, desc="Filtering")
+        test_dataset = test_dataset.remove_columns(["keep"])
+
     model = None
     tokenizer = None
     data_collator = None
@@ -127,7 +145,7 @@ if __name__ == "__main__":
     if args.is_teacher:
         print(f"Loading TEACHER model: {args.model}")
         model_path = teacher_model_info[args.model]["path"]
-        model = PreTrainedModel(model_path, device)
+        model = PreTrainedModel(model_path, device, max_len=args.max_length)
         tokenizer = model.asm_tokenizer # For reference, though not used for pre-tokenization
         data_collator = custom_collate_for_text
 
