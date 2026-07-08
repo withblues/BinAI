@@ -46,13 +46,20 @@ class InfoNCEDatasetWithLookup(Dataset):
         
         # We still flatten the lookup for easy indexing
         self.flat_examples = []
+        total_pairs = 0
         for anchor_id, examples in lookup.items():
             for ex in examples:
+                total_pairs += 1
+                if anchor_id not in self.id2idx or ex['positive_id'] not in self.id2idx:
+                    continue
                 self.flat_examples.append({
                     'anchor_id': anchor_id,
                     'positive_id': ex['positive_id'],
                     'negative_ids': ex['negative_ids']
                 })
+        
+        if len(self.flat_examples) < total_pairs:
+            print(f"InfoNCEDatasetWithLookup: Kept {len(self.flat_examples)} / {total_pairs} pairs after dropping truncated items.")
         
         # Get a list of all valid IDs from the id2idx map for random sampling fallback
         self.valid_ids_pool = list(self.id2idx.keys())
@@ -114,12 +121,19 @@ class InBatchInfoNCEDataset(Dataset):
         
         # We still flatten the lookup for easy indexing
         self.flat_examples = []
+        total_pairs = 0
         for anchor_id, examples in lookup.items():
             for ex in examples:
+                total_pairs += 1
+                if anchor_id not in self.id2idx or ex['positive_id'] not in self.id2idx:
+                    continue
                 self.flat_examples.append({
                     'anchor_id': anchor_id,
                     'positive_id': ex['positive_id']
                 })
+        
+        if len(self.flat_examples) < total_pairs:
+            print(f"InBatchInfoNCEDataset: Kept {len(self.flat_examples)} / {total_pairs} pairs after dropping truncated items.")
 
     def __len__(self):
         return len(self.flat_examples)
