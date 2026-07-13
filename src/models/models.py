@@ -503,7 +503,11 @@ class StudentWithJointInBatch(nn.Module):
         self.register_buffer('w_distill', torch.tensor(lambda_distill, dtype=torch.float32))
         
         self.infonce_criterion = nn.CrossEntropyLoss()
-        self.distill_criterion = nn.MSELoss()
+        
+        if self.distill_loss_type == 'embedding_cosine':
+            self.distill_criterion = nn.CosineEmbeddingLoss()
+        else:
+            self.distill_criterion = nn.MSELoss()
 
     def forward(self, input_ids, attention_mask=None, binary_names=None, function_names=None, teacher_embeddings=None, masked_input_ids=None, mlm_labels=None, **kwargs):
         
@@ -654,6 +658,12 @@ class StudentWithJointInBatch(nn.Module):
                 
                 pair_loss = -F.logsigmoid(student_diff)
                 distill_loss = (teacher_gap * pair_loss).mean()
+            elif self.distill_loss_type == 'embedding_cosine':
+                target = torch.ones(student_embeddings.size(0), device=student_embeddings.device)
+                distill_loss = self.distill_criterion(student_embeddings, teacher_embeddings, target)
+            elif self.distill_loss_type == 'embedding_mse':
+                # Direct MSE on the normalized embeddings
+                distill_loss = self.distill_criterion(student_embeddings, teacher_embeddings)
             else:
                 distill_loss = self.distill_criterion(student_sims_unscaled, teacher_sims)
             

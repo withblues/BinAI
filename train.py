@@ -337,7 +337,6 @@ if __name__ == "__main__":
     parser.add_argument("--filter_truncated", action='store_true', help="Filter out any data that is equal to or exceeds max_len tokens.")
     parser.add_argument("--resume_from_checkpoint", action='store_true', help="Resume training from the last checkpoint in the output directory.")
     parser.add_argument("--batch_size", type=int, default=128, help="Per-device train and eval batch size.")
-    
     # Joint training arguments
     parser.add_argument("--lambda_mlm", type=float, default=1.0)
     parser.add_argument("--use_cross_gpu_negatives", action='store_true', help="Use GatherLayer to fetch negatives from all GPUs for InfoNCE scaling.")
@@ -345,7 +344,7 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_distill", type=float, default=1.0)
     parser.add_argument("--mlm_probability", type=float, default=0.15)
     parser.add_argument("--top_k", type=int, default=10, help="Number of targets per anchor for InfoNCE/Joint")
-    parser.add_argument("--distill_loss_type", type=str, default='mse', choices=['mse', 'cosine', 'kl', 'kl_retrieval', 'topk_kl', 'topk_kl_retrieval', 'pairwiserank', 'pairwiserank_retrieval'], help="Loss function for similarity distillation in joint training.")
+    parser.add_argument("--distill_loss_type", type=str, default='mse', choices=['mse', 'cosine', 'kl', 'kl_retrieval', 'topk_kl', 'topk_kl_retrieval', 'pairwiserank', 'pairwiserank_retrieval', 'embedding_cosine', 'embedding_mse'], help="Loss function for similarity distillation in joint training.")
     
     # --- New option for OL-AUX dynamic weighting ---
     parser.add_argument("--use_ol_aux", action='store_true', help="Use Online Learning for Auxiliary tasks (OL-AUX) to dynamically weight MLM and Distillation.")
@@ -788,7 +787,7 @@ if __name__ == "__main__":
 
 
     # output dir
-    output_dir_name = f'{method}_{args.max_len}{finetuning_details}{init_suffix}{ol_aux_details}{lambda_details}{nce_details}{distill_type_details}'
+    output_dir_name = f'{method}_{args.max_len}{filter_trunc_details}{finetuning_details}{init_suffix}{ol_aux_details}{lambda_details}{nce_details}{distill_type_details}'
     output_dir = os.path.join(output_dir, f"bert_{args.split}", teacher_type, output_dir_name)
     print(f'output dir: {output_dir}')
     os.makedirs(output_dir, exist_ok=True)
