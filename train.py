@@ -173,11 +173,12 @@ class InBatchInfoNCECollator:
         return batch
 
 class JointTrainer(Trainer):
-    def __init__(self, *args, ol_aux_beta=0.001, ol_aux_horizon=10, use_ol_aux=False, ol_aux_strict_paper=False, nce_start_step=0, **kwargs):
+    def __init__(self, *args, ol_aux_beta=0.001, ol_aux_horizon=10, use_ol_aux=False, analyze_gradients=False, ol_aux_strict_paper=False, nce_start_step=0, **kwargs):
         super().__init__(*args, **kwargs)
         self.ol_aux_beta = ol_aux_beta
         self.ol_aux_horizon = ol_aux_horizon
         self.use_ol_aux = use_ol_aux
+        self.analyze_gradients = analyze_gradients
         self.ol_aux_strict_paper = ol_aux_strict_paper
         self.nce_start_step = nce_start_step
         
@@ -195,8 +196,8 @@ class JointTrainer(Trainer):
         # 1. Safely unwrap the model for Multi-GPU compatibility
         actual_model = self.model.module if hasattr(self.model, "module") else self.model
 
-        if not self.use_ol_aux:
-            outputs = model(**inputs, use_ol_aux=self.use_ol_aux)
+        if not (self.use_ol_aux or self.analyze_gradients):
+            outputs = model(**inputs, use_ol_aux=False)
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
             if self.model.training and isinstance(outputs, dict):
                 logs = {f"train/{k}": (v.item() if hasattr(v, 'item') else v) for k, v in outputs.items() if "loss" in k or "w_" in k}
@@ -256,14 +257,14 @@ class JointTrainer(Trainer):
                 grad_main, norm_main = get_normalized_proxy_grad(L_main)
                 
                 if grad_main is not None:
-                    if L_mlm > 0:
+                    if isinstance(L_mlm, torch.Tensor) and L_mlm.requires_grad:
                         grad_mlm, norm_mlm = get_normalized_proxy_grad(L_mlm)
                         if grad_mlm is not None:
                             sampled_dot_mlm = torch.nan_to_num(torch.dot(grad_main, grad_mlm)).item()
                             if norm_mlm > 0:
                                 self.scale_mlm = torch.clamp(norm_main / norm_mlm, min=0.001, max=1000.0).item()
                     
-                    if L_distill > 0:
+                    if isinstance(L_distill, torch.Tensor) and L_distill.requires_grad:
                         grad_distill, norm_distill = get_normalized_proxy_grad(L_distill)
                         if grad_distill is not None:
                             sampled_dot_distill = torch.nan_to_num(torch.dot(grad_main, grad_distill)).item()
@@ -277,7 +278,7 @@ class JointTrainer(Trainer):
             # ------------------------------------------
             # 3. DYNAMIC WEIGHT UPDATE
             # ------------------------------------------
-            if nce_active and (self.step_counter % self.ol_aux_horizon == 0):
+            if self.use_ol_aux and nce_active and (self.step_counter % self.ol_aux_horizon == 0):
                 with torch.no_grad():
                     if self.ol_aux_strict_paper:
                         new_w_mlm = actual_model.w_mlm + (self.ol_aux_beta * self.dot_mlm_acc)
@@ -296,24 +297,35 @@ class JointTrainer(Trainer):
         # ------------------------------------------
         # GradNorm + OL-AUX: Explicit gradient magnitude balancing!
         if nce_active:
-            total_loss = (actual_model.lambda_nce * L_main) + \
-                         (actual_model.w_mlm * self.scale_mlm * L_mlm) + \
-                         (actual_model.w_distill * self.scale_distill * L_distill)
+            if self.use_ol_aux:
+                total_loss = (actual_model.lambda_nce * L_main) + \
+                             (actual_model.w_mlm * self.scale_mlm * L_mlm) + \
+                             (actual_model.w_distill * self.scale_distill * L_distill)
+            else:
+                total_loss = (actual_model.lambda_nce * L_main) + \
+                             (actual_model.lambda_mlm * L_mlm) + \
+                             (actual_model.lambda_distill * L_distill)
         else:
             # Curriculum phase: only MLM + Distillation
             total_loss = L_mlm + L_distill
         
         outputs["loss"] = total_loss
-        outputs["w_mlm"] = actual_model.w_mlm
-        outputs["w_distill"] = actual_model.w_distill
-        outputs["scale_mlm"] = torch.tensor(self.scale_mlm, device=total_loss.device)
-        outputs["scale_distill"] = torch.tensor(self.scale_distill, device=total_loss.device)
+        if self.use_ol_aux:
+            outputs["w_mlm"] = actual_model.w_mlm
+            outputs["w_distill"] = actual_model.w_distill
+            outputs["scale_mlm"] = torch.tensor(self.scale_mlm, device=total_loss.device)
+            outputs["scale_distill"] = torch.tensor(self.scale_distill, device=total_loss.device)
+            
+        if self.model.training and (self.use_ol_aux or self.analyze_gradients):
+            outputs["cos_sim_mlm"] = torch.tensor(sampled_dot_mlm, device=total_loss.device)
+            outputs["cos_sim_distill"] = torch.tensor(sampled_dot_distill, device=total_loss.device)
+            
         outputs["temperature"] = torch.tensor(actual_model.temperature, device=total_loss.device)
         outputs["nce_active"] = torch.tensor(1.0 if nce_active else 0.0, device=total_loss.device)
 
         # Logging happens AFTER outputs are correctly populated
         if self.model.training:
-            logs = {f"train/{k}": v.item() for k, v in outputs.items() if "loss" in k or "w_" in k or "scale_" in k or k in ("temperature", "nce_active")}
+            logs = {f"train/{k}": v.item() for k, v in outputs.items() if "loss" in k or "w_" in k or "scale_" in k or "cos_sim_" in k or k in ("temperature", "nce_active")}
             self.log(logs)
         else:
             logs = {f"eval/{k}": v.item() for k, v in outputs.items() if "loss" in k}
@@ -337,6 +349,7 @@ if __name__ == "__main__":
     parser.add_argument("--filter_truncated", action='store_true', help="Filter out any data that is equal to or exceeds max_len tokens.")
     parser.add_argument("--resume_from_checkpoint", action='store_true', help="Resume training from the last checkpoint in the output directory.")
     parser.add_argument("--batch_size", type=int, default=128, help="Per-device train and eval batch size.")
+    parser.add_argument("--num_train_epochs", type=int, default=6, help="Number of training epochs.")
     # Joint training arguments
     parser.add_argument("--lambda_mlm", type=float, default=1.0)
     parser.add_argument("--use_cross_gpu_negatives", action='store_true', help="Use GatherLayer to fetch negatives from all GPUs for InfoNCE scaling.")
@@ -348,10 +361,11 @@ if __name__ == "__main__":
     
     # --- New option for OL-AUX dynamic weighting ---
     parser.add_argument("--use_ol_aux", action='store_true', help="Use Online Learning for Auxiliary tasks (OL-AUX) to dynamically weight MLM and Distillation.")
+    parser.add_argument("--analyze_gradients", action='store_true', help="Compute and log gradient cosine similarities without updating OL-AUX dynamic weights.")
     
 
     
-    parser.add_argument("--temperature_init", type=float, default=0.07, help="Initial temperature for InfoNCE loss (if no scheduler is used, stays constant).")
+    parser.add_argument("--temperature_init", type=float, default=0.05, help="Initial temperature for InfoNCE loss (if no scheduler is used, stays constant).")
     parser.add_argument("--distill_temperature", type=float, default=2.0, help="Temperature for KL distillation. Typically much higher than InfoNCE (e.g. 2.0).")
     parser.add_argument("--distill_topk", type=int, default=32, help="Number of top candidates for rank distillation.")
     parser.add_argument("--ol_aux_beta", type=float, default=0.001, help="Learning rate for auxiliary task weights (w).")
@@ -740,10 +754,8 @@ if __name__ == "__main__":
     finetuning_details = ""
     if args.finetune_checkpoint:
         finetuning_details += f"_from_{args.finetune_checkpoint}"
-        if args.use_projector_in_ft:
-            finetuning_details += "_with_proj"
-        else:
-            finetuning_details += "_no_proj"
+        
+    proj_details = "_with_proj" if args.use_projector_in_ft else "_no_proj"
     
     # Add initialization details
     init_suffix = ""
@@ -761,9 +773,9 @@ if __name__ == "__main__":
             ol_aux_details = f"_olaux_b{args.ol_aux_beta}_h{args.ol_aux_horizon}"
             if args.ol_aux_strict_paper:
                 ol_aux_details += "_strict"
-        else:
-            if args.lambda_mlm != 1.0 or args.lambda_distill != 1.0 or args.lambda_nce != 1.0:
-                lambda_details = f"_m{args.lambda_mlm}_d{args.lambda_distill}_n{args.lambda_nce}"
+                
+        if args.lambda_mlm != 1.0 or args.lambda_distill != 1.0 or args.lambda_nce != 1.0:
+            lambda_details = f"_m{args.lambda_mlm}_d{args.lambda_distill}_n{args.lambda_nce}"
             
     if getattr(args, 'use_cross_gpu_negatives', False):
         lambda_details += "_crossgpu"
@@ -776,8 +788,16 @@ if __name__ == "__main__":
     if args.distill_loss_type != 'mse' and (technique == 'joint' or technique == 'joint_in_batch' or technique == 'cosine_in_batch'):
         distill_type_details = f"_{args.distill_loss_type}"
     filter_trunc_details = "_filter_trunc" if args.filter_truncated else ""
+    analyze_grad_details = "_analyze_grads" if getattr(args, 'analyze_gradients', False) else ""
+    bs_details = f"_bs{args.batch_size}"
+    
+    temp_details = ""
+    if args.temperature_init != 0.05:
+        temp_details += f"_t{args.temperature_init}"
+    if args.distill_temperature != 2.0 and (technique == 'joint' or technique == 'joint_in_batch' or technique == 'cosine_in_batch'):
+        temp_details += f"_dt{args.distill_temperature}"
         
-    run_name += f'_{args.max_len}' + filter_trunc_details + finetuning_details + init_suffix + ol_aux_details + lambda_details + nce_details + distill_type_details
+    run_name += f'_{args.max_len}{bs_details}' + filter_trunc_details + finetuning_details + proj_details + init_suffix + ol_aux_details + lambda_details + nce_details + distill_type_details + temp_details + analyze_grad_details
     print(f'run name: {run_name}')
     wandb.init(
         project=project_name,
@@ -787,7 +807,7 @@ if __name__ == "__main__":
 
 
     # output dir
-    output_dir_name = f'{method}_{args.max_len}{filter_trunc_details}{finetuning_details}{init_suffix}{ol_aux_details}{lambda_details}{nce_details}{distill_type_details}'
+    output_dir_name = f'{method}_{args.max_len}{bs_details}{filter_trunc_details}{finetuning_details}{proj_details}{init_suffix}{ol_aux_details}{lambda_details}{nce_details}{distill_type_details}{temp_details}{analyze_grad_details}'
     output_dir = os.path.join(output_dir, f"bert_{args.split}", teacher_type, output_dir_name)
     print(f'output dir: {output_dir}')
     os.makedirs(output_dir, exist_ok=True)
@@ -813,7 +833,7 @@ if __name__ == "__main__":
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=1,
-        num_train_epochs=6,
+        num_train_epochs=args.num_train_epochs,
         max_steps=args.max_steps, # 14046 for project split
         logging_steps=1,
         learning_rate=1e-5,
@@ -843,6 +863,7 @@ if __name__ == "__main__":
             processing_class=tokenizer,
             data_collator=custom_collate,
             use_ol_aux=args.use_ol_aux,
+            analyze_gradients=args.analyze_gradients,
             ol_aux_beta=args.ol_aux_beta,
             ol_aux_horizon=args.ol_aux_horizon,
             ol_aux_strict_paper=args.ol_aux_strict_paper,

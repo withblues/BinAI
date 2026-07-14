@@ -511,7 +511,7 @@ class StudentWithJointInBatch(nn.Module):
 
     def forward(self, input_ids, attention_mask=None, binary_names=None, function_names=None, teacher_embeddings=None, masked_input_ids=None, mlm_labels=None, **kwargs):
         
-        mlm_loss = 0.0
+        mlm_loss = torch.tensor(0.0, device=input_ids.device)
         
         # --- PASS 1: MLM on Anchor Sequences ---
         if masked_input_ids is not None and mlm_labels is not None and self.lambda_mlm > 0:
@@ -546,8 +546,8 @@ class StudentWithJointInBatch(nn.Module):
 
         total_loss = None
         predicted_scores = None
-        nce_loss = 0.0
-        distill_loss = 0.0
+        nce_loss = torch.tensor(0.0, device=input_ids.device)
+        distill_loss = torch.tensor(0.0, device=input_ids.device)
 
         if binary_names is not None and function_names is not None and teacher_embeddings is not None:
             total_b = student_embeddings.shape[0]
@@ -674,8 +674,8 @@ class StudentWithJointInBatch(nn.Module):
             "logits": predicted_scores,
             "nce_loss": nce_loss,
             "nce_loss_scaled": self.lambda_nce * nce_loss,
-            "distill_loss": distill_loss if teacher_embeddings is not None else None,
-            "distill_loss_scaled": self.lambda_distill * distill_loss if teacher_embeddings is not None else None,
+            "distill_loss": distill_loss,
+            "distill_loss_scaled": self.lambda_distill * distill_loss,
             "mlm_loss": mlm_loss,
             "mlm_loss_scaled": self.lambda_mlm * mlm_loss
         }
