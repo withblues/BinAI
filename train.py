@@ -1,4 +1,5 @@
 import os
+import sys
 from datasets import load_from_disk
 import argparse
 import json
@@ -79,6 +80,8 @@ class SimpleInBatchCollator:
         all_input_ids = []
         all_attention_masks = []
         all_teacher_embeddings = []
+        all_binary_names = []
+        all_function_names = []
         
         for f in features:
             if len(f["input_ids"]) > 0 and isinstance(f["input_ids"][0], list):
@@ -87,6 +90,16 @@ class SimpleInBatchCollator:
             else:
                 all_input_ids.append(f["input_ids"])
                 all_attention_masks.append(f["attention_mask"])
+
+            if "binary_name" in f:
+                all_binary_names.append(f["binary_name"])
+            elif "binary_names" in f:
+                all_binary_names.append(f["binary_names"])
+
+            if "function_names" in f:
+                all_function_names.append(f["function_names"])
+            elif "function_name" in f:
+                all_function_names.append(f["function_name"])
                 
             if "labels" in f:
                 if len(f["input_ids"]) > 0 and isinstance(f["input_ids"][0], list):
@@ -109,6 +122,11 @@ class SimpleInBatchCollator:
             "input_ids": padded["input_ids"],
             "attention_mask": padded["attention_mask"],
         }
+
+        if all_binary_names:
+            batch["binary_names"] = all_binary_names
+        if all_function_names:
+            batch["function_names"] = all_function_names
         
         if all_teacher_embeddings:
             batch["teacher_embeddings"] = torch.tensor(np.array(all_teacher_embeddings), dtype=torch.float32)
@@ -317,8 +335,9 @@ class JointTrainer(Trainer):
             outputs["scale_distill"] = torch.tensor(self.scale_distill, device=total_loss.device)
             
         if self.model.training and (self.use_ol_aux or self.analyze_gradients):
-            outputs["cos_sim_mlm"] = torch.tensor(sampled_dot_mlm, device=total_loss.device)
-            outputs["cos_sim_distill"] = torch.tensor(sampled_dot_distill, device=total_loss.device)
+            if nce_active and (self.ol_aux_strict_paper or (self.step_counter % self.ol_aux_horizon == 0)):
+                outputs["cos_sim_mlm"] = torch.tensor(sampled_dot_mlm, device=total_loss.device)
+                outputs["cos_sim_distill"] = torch.tensor(sampled_dot_distill, device=total_loss.device)
             
         outputs["temperature"] = torch.tensor(actual_model.temperature, device=total_loss.device)
         outputs["nce_active"] = torch.tensor(1.0 if nce_active else 0.0, device=total_loss.device)
@@ -373,6 +392,8 @@ if __name__ == "__main__":
     parser.add_argument("--ol_aux_strict_paper", action='store_true', help="Accumulate gradients every step as per the NeurIPS 2019 paper (slower but theoretically sound).")
     parser.add_argument("--nce_start_step", type=int, default=0, help="Step at which to enable InfoNCE loss (curriculum learning). Before this step, only MLM+Distill train.")
     parser.add_argument("--max_steps", type=int, default=-1, help="If > 0, set total number of training steps to perform. Overrides num_train_epochs.")
+    parser.add_argument("--analyze_batches", action='store_true', help="Analyze training batch structure and exit without training.")
+    parser.add_argument("--num_analyze_batches", type=int, default=10, help="Number of batches to analyze (default: 10, set to -1 for all).")
 
     args = parser.parse_args()
     # print all args
@@ -839,7 +860,7 @@ if __name__ == "__main__":
         learning_rate=1e-5,
         weight_decay=0.01,
         warmup_ratio=0.1,
-        #tf32=True,
+        tf32=True,
         report_to='wandb',
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
@@ -880,6 +901,139 @@ if __name__ == "__main__":
         )
 
     # start training
+    if args.analyze_batches:
+        print(f"\n=== Analyzing Batches & Label Agreement (Method: {method}, Split: {args.split}) ===")
+        dataloader = trainer.get_train_dataloader()
+        
+        total_off_diag_pairs = 0
+        total_func_matches = 0
+        total_exact_matches = 0
+        
+        same_bin_same_func_sims = []
+        same_func_diff_bin_sims = []
+        same_func_sims = []
+        diff_func_sims = []
+
+        def calc_stats(x):
+            if len(x) == 0:
+                return {"mean": 0.0, "std": 0.0, "p5": 0.0, "p50": 0.0, "p95": 0.0}
+            arr = np.array(x)
+            return {
+                "mean": float(np.mean(arr)),
+                "std": float(np.std(arr)),
+                "p5": float(np.percentile(arr, 5)),
+                "p50": float(np.percentile(arr, 50)),
+                "p95": float(np.percentile(arr, 95)),
+            }
+        
+        for step, batch in enumerate(dataloader):
+            print(f"\n--- Batch {step + 1} ---")
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    print(f"  {k}: shape={list(v.shape)}, dtype={v.dtype}")
+                elif isinstance(v, list):
+                    print(f"  {k}: len={len(v)}")
+                else:
+                    print(f"  {k}: type={type(v)}")
+            
+            if "attention_mask" in batch:
+                non_pad = (batch["attention_mask"] == 1).sum().item()
+                total = batch["attention_mask"].numel()
+                print(f"  Padding ratio: {(1 - non_pad / total):.2%}")
+
+            func_names = batch.get("function_names")
+            bin_names = batch.get("binary_names")
+            
+            if func_names:
+                B = len(func_names)
+                unique_funcs = len(set(func_names))
+                print(f"  Unique functions in batch ({B} samples): {unique_funcs}")
+                
+                # Pairwise label agreement
+                func_matches = 0
+                exact_matches = 0
+                off_diag_count = B * (B - 1)
+                
+                teacher_sims = None
+                if "teacher_embeddings" in batch:
+                    t_emb = batch["teacher_embeddings"]
+                    t_norm = torch.nn.functional.normalize(t_emb, p=2, dim=-1)
+                    teacher_sims = torch.matmul(t_norm, t_norm.T)
+
+                for i in range(B):
+                    for j in range(B):
+                        if i == j:
+                            continue
+                        same_func = (func_names[i] == func_names[j])
+                        same_bin = (bin_names[i] == bin_names[j]) if bin_names else False
+                        
+                        if same_func:
+                            func_matches += 1
+                            if same_bin:
+                                exact_matches += 1
+                        
+                        if teacher_sims is not None:
+                            sim_val = teacher_sims[i, j].item()
+                            if same_func and same_bin:
+                                same_bin_same_func_sims.append(sim_val)
+                                same_func_sims.append(sim_val)
+                            elif same_func and not same_bin:
+                                same_func_diff_bin_sims.append(sim_val)
+                                same_func_sims.append(sim_val)
+                            else:
+                                diff_func_sims.append(sim_val)
+                                
+                total_off_diag_pairs += off_diag_count
+                total_func_matches += func_matches
+                total_exact_matches += exact_matches
+                
+                collision_rate = (func_matches / off_diag_count) if off_diag_count > 0 else 0
+                print(f"  Function Name collisions in batch: {func_matches} / {off_diag_count} pairs ({collision_rate:.2%})")
+                if bin_names:
+                    print(f"  Exact (Binary + Function) matches in batch: {exact_matches} / {off_diag_count} pairs")
+                
+            if args.num_analyze_batches > 0 and (step + 1) >= args.num_analyze_batches:
+                print(f"\nCompleted analyzing {step + 1} batches.")
+                break
+                
+        print("\n================ SUMMARY GROUND TRUTH HIERARCHY & STATS ================")
+        if total_off_diag_pairs > 0:
+            same_bin_diff_func = total_func_matches - total_exact_matches
+            diff_func_count = total_off_diag_pairs - total_func_matches
+            
+            print(f"Total Off-Diagonal Sample Pairs Analyzed: {total_off_diag_pairs}")
+            print(f"Total Function Name Matches: {total_func_matches} ({total_func_matches / total_off_diag_pairs:.2%})")
+            print(f"  ├─ Exact Matches (Same Binary + Function): {total_exact_matches} ({total_exact_matches / total_off_diag_pairs:.2%})")
+            print(f"  └─ Same Name, Diff Binary Matches: {same_bin_diff_func} ({same_bin_diff_func / total_off_diag_pairs:.2%})")
+            print(f"Total Different Function Pairs: {diff_func_count} ({diff_func_count / total_off_diag_pairs:.2%})")
+            
+            if same_func_sims or diff_func_sims:
+                s_exact = calc_stats(same_bin_same_func_sims)
+                s_diff_bin = calc_stats(same_func_diff_bin_sims)
+                s_same_func = calc_stats(same_func_sims)
+                s_diff_func = calc_stats(diff_func_sims)
+
+                print("\n--- Teacher Cosine Similarity Statistics by Ground Truth Hierarchy ---")
+                print(f"1. Same Binary + Same Function (n={len(same_bin_same_func_sims)}):")
+                print(f"   mean={s_exact['mean']:.4f}, std={s_exact['std']:.4f}, p5={s_exact['p5']:.4f}, p50={s_exact['p50']:.4f}, p95={s_exact['p95']:.4f}")
+                
+                print(f"2. Same Name, Different Binary (n={len(same_func_diff_bin_sims)}):")
+                print(f"   mean={s_diff_bin['mean']:.4f}, std={s_diff_bin['std']:.4f}, p5={s_diff_bin['p5']:.4f}, p50={s_diff_bin['p50']:.4f}, p95={s_diff_bin['p95']:.4f}")
+                
+                print(f"3. Different Function (n={len(diff_func_sims)}):")
+                print(f"   mean={s_diff_func['mean']:.4f}, std={s_diff_func['std']:.4f}, p5={s_diff_func['p5']:.4f}, p50={s_diff_func['p50']:.4f}, p95={s_diff_func['p95']:.4f}")
+                
+                gap = s_same_func["mean"] - s_diff_func["mean"]
+                gap_exact = s_exact["mean"] - s_diff_func["mean"]
+                
+                print("\n--- Teacher/Student Comparison Metrics ---")
+                print(f"Cosine separation gap (Same Function vs Diff Function): {gap:.4f}")
+                print(f"Cosine separation gap (Same Binary+Function vs Diff Function): {gap_exact:.4f}")
+        print("=========================================================================")
+
+        print("Batch analysis complete. Exiting without training.")
+        sys.exit(0)
+
     resume_checkpoint = True if args.resume_from_checkpoint else None
     trainer.train(resume_from_checkpoint=resume_checkpoint)
 
