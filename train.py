@@ -68,7 +68,7 @@ class JointDataCollator:
         }
         
         if all_teacher_embeddings:
-            batch["teacher_embeddings"] = torch.tensor(np.array(all_teacher_embeddings), dtype=torch.float32)
+            batch["teacher_embeddings"] = torch.as_tensor(all_teacher_embeddings, dtype=torch.float32)
             
         return batch
 
@@ -129,7 +129,7 @@ class SimpleInBatchCollator:
             batch["function_names"] = all_function_names
         
         if all_teacher_embeddings:
-            batch["teacher_embeddings"] = torch.tensor(np.array(all_teacher_embeddings), dtype=torch.float32)
+            batch["teacher_embeddings"] = torch.as_tensor(all_teacher_embeddings, dtype=torch.float32)
             
         return batch
 
@@ -186,7 +186,7 @@ class InBatchInfoNCECollator:
             batch["mlm_labels"] = mlm_labels
         
         if anchor_teacher_embeddings and positive_teacher_embeddings:
-            batch["teacher_embeddings"] = torch.tensor(anchor_teacher_embeddings + positive_teacher_embeddings, dtype=torch.float32)
+            batch["teacher_embeddings"] = torch.as_tensor(anchor_teacher_embeddings + positive_teacher_embeddings, dtype=torch.float32)
 
         return batch
 
@@ -764,9 +764,7 @@ if __name__ == "__main__":
                     return_tensors='pt',
                 )
 
-                labels_np = np.array(all_labels)
-                batch_labels = torch.from_numpy(labels_np).float()
-                padded_batch['labels'] = batch_labels
+                padded_batch['labels'] = torch.as_tensor(all_labels, dtype=torch.float32)
 
                 return padded_batch
         

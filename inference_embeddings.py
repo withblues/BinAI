@@ -140,12 +140,13 @@ if __name__ == "__main__":
     model = None
     tokenizer = None
     data_collator = None
+    init_suffix = ""
 
     # --- REFACTORED LOGIC: Handle TEACHER models first ---
     if args.is_teacher:
         print(f"Loading TEACHER model: {args.model}")
         model_path = teacher_model_info[args.model]["path"]
-        model = PreTrainedModel(model_path, device, max_len=args.max_length)
+        model = PreTrainedModel(model_path, device)
         tokenizer = model.asm_tokenizer # For reference, though not used for pre-tokenization
         data_collator = custom_collate_for_text
 

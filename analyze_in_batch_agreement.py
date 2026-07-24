@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=128, help="Simulated batch size")
     parser.add_argument("--num_batches", type=int, default=1000, help="Number of batches to simulate")
     parser.add_argument("--structured_batch", action='store_true', help="If true, construct batches as [Anchors, Positives] like InBatchInfoNCECollator")
+    parser.add_argument("--student_embeddings_path", type=str, default=None, help="Path to student embeddings dataset")
     args = parser.parse_args()
 
     print(f"Loading split {args.split}...")
@@ -24,17 +25,27 @@ def main():
         indices = json.load(f)
     test_ids = set(indices["test"])
 
-    print("Loading dataset...")
-    dataset = load_from_disk(os.path.join(args.data_dir, f'assembly_x64_1024_{args.teacher_type}'))
+    print("Loading dataset metadata...")
+    dataset = load_from_disk(os.path.join(args.data_dir, 'assembly_x64_1024_clap'))
     
     print("Filtering to test set...")
     test_dataset = dataset.filter(lambda x: x['unique_id'] in test_ids, num_proc=16)
     
-    print("Formatting dataset...")
-    test_dataset.set_format(columns=['unique_id', 'binary_name', 'function_name', f'{args.teacher_type}_embedding'])
+    print("Formatting metadata...")
+    test_dataset.set_format(columns=['unique_id', 'binary_name', 'function_name'])
 
-    print("Loading all embeddings into RAM...")
-    all_embeddings = np.array(test_dataset[f'{args.teacher_type}_embedding'])
+    if args.student_embeddings_path:
+        print(f"Loading student embeddings from {args.student_embeddings_path}...")
+        student_dataset = load_from_disk(args.student_embeddings_path)
+        student_dataset.set_format(columns=['unique_id', 'embedding'])
+        id_to_emb = {uid: emb for uid, emb in zip(student_dataset['unique_id'], student_dataset['embedding'])}
+        all_embeddings = np.array([id_to_emb[uid] for uid in test_dataset['unique_id']])
+        eval_name = "Student"
+    else:
+        test_dataset.set_format(columns=['unique_id', 'binary_name', 'function_name', f'{args.teacher_type}_embedding'])
+        all_embeddings = np.array(test_dataset[f'{args.teacher_type}_embedding'])
+        eval_name = f"Teacher ({args.teacher_type})"
+
     norms = np.linalg.norm(all_embeddings, axis=1, keepdims=True)
     norms[norms == 0] = 1e-9
     all_embeddings = all_embeddings / norms
@@ -120,7 +131,7 @@ def main():
     mean_pearson = np.mean(pearson_scores)
     
     print("\n--- In-Batch Label Agreement Analysis ---")
-    print(f"Teacher: {args.teacher_type}")
+    print(f"Evaluated: {eval_name}")
     print(f"Batch Size: {args.batch_size}")
     print(f"Structured Batches: {args.structured_batch}")
     print(f"Number of valid batches analyzed: {len(auroc_scores)}")

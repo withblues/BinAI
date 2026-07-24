@@ -16,6 +16,8 @@ def main():
     parser.add_argument("--split", default='project')
     parser.add_argument("--teacher_type", default='clap')
     parser.add_argument("--num_samples", type=int, default=100000, help="Number of positive and negative pairs to sample")
+    parser.add_argument("--student_embeddings_path", type=str, default=None, help="Path to student embeddings dataset")
+    parser.add_argument("--plot_prefix", type=str, default=None, help="Prefix for the saved plot filename")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -25,15 +27,32 @@ def main():
         indices = json.load(f)
     test_ids = set(indices["test"])
 
-    print("Loading dataset...")
-    dataset = load_from_disk(os.path.join(args.data_dir, f'assembly_x64_1024_{args.teacher_type}'))
+    print("Loading dataset metadata...")
+    dataset = load_from_disk(os.path.join(args.data_dir, 'assembly_x64_1024_clap'))
     
     print("Filtering to test set...")
     test_dataset = dataset.filter(lambda x: x['unique_id'] in test_ids, num_proc=16)
     
-    # We only need embeddings and ground truth keys
-    print("Formatting dataset...")
-    test_dataset.set_format(columns=['unique_id', 'binary_name', 'function_name', f'{args.teacher_type}_embedding'])
+    print("Formatting metadata...")
+    test_dataset.set_format(columns=['unique_id', 'binary_name', 'function_name'])
+
+    if args.student_embeddings_path:
+        print(f"Loading student embeddings from {args.student_embeddings_path}...")
+        student_dataset = load_from_disk(args.student_embeddings_path)
+        student_dataset.set_format(columns=['unique_id', 'embedding'])
+        # Create a mapping from unique_id to embedding
+        id_to_emb = {uid: emb for uid, emb in zip(student_dataset['unique_id'], student_dataset['embedding'])}
+        
+        # Reorder embeddings to match test_dataset
+        all_embeddings = np.array([id_to_emb[uid] for uid in test_dataset['unique_id']])
+        title_name = "Student"
+        prefix = args.plot_prefix if args.plot_prefix else "student"
+    else:
+        # Load teacher embeddings
+        test_dataset.set_format(columns=['unique_id', 'binary_name', 'function_name', f'{args.teacher_type}_embedding'])
+        all_embeddings = np.array(test_dataset[f'{args.teacher_type}_embedding'])
+        title_name = f"Teacher ({args.teacher_type})"
+        prefix = args.plot_prefix if args.plot_prefix else f"teacher_{args.teacher_type}"
 
     print("Building lookup structures...")
     # Group by ground truth key (binary_name, function_name)
@@ -119,10 +138,10 @@ def main():
     plt.hist(neg_sims, bins=100, alpha=0.5, label=f'Negative (Mean: {neg_mean:.2f})', density=True, color='red')
     plt.xlabel('Cosine Similarity')
     plt.ylabel('Density')
-    plt.title(f'Teacher Embedding Space Margin ({args.teacher_type})')
+    plt.title(f'{title_name} Embedding Space Margin')
     plt.legend(loc='upper left')
     
-    plot_path = os.path.join(args.output_dir, f'teacher_{args.teacher_type}_margin.png')
+    plot_path = os.path.join(args.output_dir, f'{prefix}_margin.png')
     plt.savefig(plot_path)
     print(f"\nSaved plot to {plot_path}")
 
