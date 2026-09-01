@@ -11,7 +11,7 @@ from tqdm import tqdm
 from src.utils.dataset import CosineDataset, InfoNCEDatasetWithLookup, InBatchInfoNCEDataset
 import numpy as np
 import random
-torch._functorch.config.donated_buffer = False
+
 
 def set_seed(seed):
     random.seed(seed)
@@ -470,8 +470,8 @@ if __name__ == "__main__":
     
     train_cache_tokenization_path = os.path.join(cache_dir, 'tokenization', f"{args.split}_train.arrow")
     val_cache_tokenization_path = os.path.join(cache_dir, 'tokenization', f"{args.split}_val.arrow")
-    train_dataset = train_dataset.map(format_and_tokenize, batched=True, num_proc=os.cpu_count() // 2, remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=train_cache_tokenization_path)
-    val_dataset = val_dataset.map(format_and_tokenize, batched=True, num_proc=os.cpu_count() // 2, remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=val_cache_tokenization_path)
+    train_dataset = train_dataset.map(format_and_tokenize, batched=True, num_proc=32, remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=train_cache_tokenization_path)
+    val_dataset = val_dataset.map(format_and_tokenize, batched=True, num_proc=32, remove_columns=columns_to_remove, desc='tokenizing data ...', cache_file_name=val_cache_tokenization_path)
 
     if args.filter_truncated:
         print(f'Len of train dataset before filtering: {len(train_dataset)}')
@@ -825,7 +825,7 @@ if __name__ == "__main__":
     if args.distill_temperature != 2.0 and (technique == 'joint' or technique == 'joint_in_batch' or technique == 'cosine_in_batch'):
         temp_details += f"_dt{args.distill_temperature}"
 
-    seed_details = f"_seed{args.seed}" if args.seed != 42 else ""
+    seed_details = f"_seed{args.seed}"
         
     run_name += f'_{args.max_len}{bs_details}' + filter_trunc_details + finetuning_details + proj_details + init_suffix + ol_aux_details + lambda_details + nce_details + distill_type_details + temp_details + analyze_grad_details + seed_details
     print(f'run name: {run_name}')
@@ -882,7 +882,7 @@ if __name__ == "__main__":
         save_safetensors=False,
         dataloader_num_workers=8,
         dataloader_pin_memory=True,
-        dataloader_prefetch_factor=2,
+        dataloader_prefetch_factor=4,
         torch_compile=True,
         label_names=label_names,
     )
