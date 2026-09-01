@@ -1,384 +1,357 @@
+"""Calculate exact full-corpus retrieval metrics from stored embeddings."""
+
+from __future__ import annotations
+
 import argparse
-import os
-import torch
-from tqdm import tqdm
-import numpy as np
-import time
-from datasets import load_from_disk
+from collections import Counter
+from dataclasses import asdict
 import json
+import os
+from pathlib import Path
+import sys
+from typing import Any
 
-def spearman_corr_batch(x, y):
-    """
-    Computes Spearman's rank correlation coefficient for a batch of tensors on the GPU.
-    Args:
-        x (torch.Tensor): A [batch_size, num_docs] tensor.
-        y (torch.Tensor): A [batch_size, num_docs] tensor.
-    Returns:
-        (torch.Tensor) A [batch_size] tensor of Spearman's Rho scores.
-    """
-    # Get the ranks of the data along the document dimension.
-    # torch.argsort twice is the standard way to get ranks.
-    x_rank = torch.argsort(torch.argsort(x, dim=1)).float()
-    y_rank = torch.argsort(torch.argsort(y, dim=1)).float()
-    
-    # Now, calculate Pearson correlation on the ranks.
-    # Center the ranks (subtract the mean)
-    x_rank_mean = torch.mean(x_rank, dim=1, keepdim=True)
-    y_rank_mean = torch.mean(y_rank, dim=1, keepdim=True)
-    x_centered = x_rank - x_rank_mean
-    y_centered = y_rank - y_rank_mean
-    
-    # Calculate covariance and standard deviations
-    covariance = torch.sum(x_centered * y_centered, dim=1)
-    x_std_dev = torch.sqrt(torch.sum(x_centered**2, dim=1))
-    y_std_dev = torch.sqrt(torch.sum(y_centered**2, dim=1))
-    
-    # Calculate the correlation coefficient
-    # Add a small epsilon for numerical stability to avoid division by zero
-    correlation = covariance / (x_std_dev * y_std_dev + 1e-12)
-    
-    return correlation
+from datasets import load_from_disk
+import numpy as np
+import torch
 
-# This denominator is constant for a given k, so we compute it once on the GPU
-# and reuse it. This is a key optimization for batched NDCG.
-DISCOUNT_FACTORS_CACHE = {}
-
-def dcg_batch(relevances_batch, k):
-    """
-    Computes Discounted Cumulative Gain for a batch of relevance scores.
-    Args:
-        relevances_batch: (torch.Tensor) A [batch_size, num_docs] tensor of relevance scores.
-        k: (int) The cutoff value.
-    Returns:
-        (torch.Tensor) A [batch_size] tensor of DCG@k scores.
-    """
-    device = relevances_batch.device
-    
-    # Get the top-k relevance scores
-    relevances_batch_k = relevances_batch[:, :k]
-    
-    # Pre-compute or retrieve discount factors from cache
-    if k not in DISCOUNT_FACTORS_CACHE or DISCOUNT_FACTORS_CACHE[k].device != device:
-        denominators = torch.log2(torch.arange(2, k + 2, device=device))
-        DISCOUNT_FACTORS_CACHE[k] = 1.0 / denominators
-        
-    discount_factors = DISCOUNT_FACTORS_CACHE[k]
-    
-    # 2^relevance - 1
-    numerators = torch.pow(2, relevances_batch_k) - 1
-    
-    # Sum the discounted gains for each item in the batch
-    return torch.sum(numerators * discount_factors, dim=1)
-
-def ndcg_at_k_batch(y_true_batch, y_score_batch, k):
-    """
-    Computes Normalized DCG for a batch of scores and ground truths.
-    Args:
-        y_true_batch: (torch.Tensor) A [batch_size, num_docs] tensor of ground truth relevance.
-        y_score_batch: (torch.Tensor) A [batch_size, num_docs] tensor of predicted scores.
-        k: (int) The cutoff value.
-    Returns:
-        (torch.Tensor) A [batch_size] tensor of NDCG@k scores.
-    """
-    # Get the ranking of documents based on predicted scores
-    predicted_order = torch.argsort(y_score_batch, dim=1, descending=True)
-    # Reorder the true relevance scores according to the prediction
-    ranked_relevance = torch.gather(y_true_batch, 1, predicted_order)
-    
-    # Calculate the DCG of the prediction
-    predicted_dcg = dcg_batch(ranked_relevance, k)
-    
-    # Get the ideal ranking based on true relevance
-    ideal_order = torch.argsort(y_true_batch, dim=1, descending=True)
-    # Reorder the true relevance scores for the ideal case
-    ideal_relevance = torch.gather(y_true_batch, 1, ideal_order)
-    
-    # Calculate the DCG of the ideal ranking
-    ideal_dcg = dcg_batch(ideal_relevance, k)
-    
-    # Avoid division by zero
-    return torch.where(ideal_dcg > 0, predicted_dcg / ideal_dcg, torch.tensor(0.0, device=y_true_batch.device))
-
-def mrr_batch(ranked_relevance_batch):
-    hits_mask = ranked_relevance_batch > 0
-    # set irrelevant positions to large index
-    indices = torch.arange(ranked_relevance_batch.size(1), device=ranked_relevance_batch.device).unsqueeze(0).expand_as(ranked_relevance_batch)
-    ranks = torch.where(hits_mask, indices + 1, torch.full_like(indices, ranked_relevance_batch.size(1) + 1))
-    first_hit_ranks, _ = ranks.min(dim=1)
-    reciprocal_ranks = torch.where(first_hit_ranks <= ranked_relevance_batch.size(1),
-                                   1.0 / first_hit_ranks.float(),
-                                   torch.zeros_like(first_hit_ranks, dtype=torch.float))
-    return reciprocal_ranks
+from src.utils.ranking_metrics import evaluate_embeddings
 
 
-def precision_at_k_batch(ranked_relevance_batch, k):
-    """
-    Computes Precision@k for a batch of ranked relevance scores.
-    """
-    # Count the number of relevant documents in the top-k
-    hits_at_k = torch.sum(ranked_relevance_batch[:, :k] > 0, dim=1)
-    return hits_at_k.float() / k
+IDENTITY_COLUMNS = ("binary_name", "function_name")
 
-def recall_at_k_batch(ranked_relevance_batch, k):
-    """
-    Computes Recall@k for a batch of ranked relevance scores.
 
-    Args:
-        ranked_relevance_batch (torch.Tensor): [batch_size, num_docs] relevance scores
-                                               already sorted by predicted rank (desc).
-        k (int): cutoff.
-    Returns:
-        torch.Tensor: [batch_size] tensor of Recall@k values.
-    """
-    device = ranked_relevance_batch.device
-    
-    # Relevant docs in top-k
-    hits_at_k = torch.sum(ranked_relevance_batch[:, :k] > 0, dim=1)
-    
-    # Total relevant docs
-    total_relevant = torch.sum(ranked_relevance_batch > 0, dim=1)
-    
-    # Safe divide: recall = hits_at_k / total_relevant
-    recall = torch.where(
-        total_relevant > 0,
-        hits_at_k.float() / total_relevant.float(),
-        torch.zeros_like(total_relevant, dtype=torch.float, device=device)
+def _python_scalar(value: Any) -> Any:
+    return value.item() if isinstance(value, np.generic) else value
+
+
+def _load_eligible_ids(path: str | None) -> set[Any] | None:
+    if path is None:
+        return None
+    if os.path.isdir(path):
+        dataset = load_from_disk(path)
+        if "unique_id" not in dataset.column_names:
+            raise ValueError(
+                f"eligible-ID dataset {path!r} does not contain a unique_id column"
+            )
+        values = np.asarray(dataset["unique_id"])
+    else:
+        values = np.load(path, allow_pickle=True)
+    if values.ndim != 1:
+        raise ValueError(
+            "--eligible_ids_path must be a Hugging Face dataset or contain a "
+            "one-dimensional NumPy array"
+        )
+    result = {_python_scalar(value) for value in values}
+    if len(result) != len(values):
+        raise ValueError("--eligible_ids_path contains duplicate IDs")
+    return result
+
+
+def _load_embeddings(
+    embeddings_dataset_path: str,
+    test_ids: set[Any],
+    eligible_ids: set[Any] | None,
+    embedding_column: str | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    dataset = load_from_disk(embeddings_dataset_path)
+    if "unique_id" not in dataset.column_names:
+        raise ValueError("embedding dataset is missing the unique_id column")
+    if embedding_column is None:
+        if "embedding" in dataset.column_names:
+            embedding_column = "embedding"
+        else:
+            candidates = [
+                column for column in dataset.column_names if column.endswith("_embedding")
+            ]
+            if len(candidates) != 1:
+                raise ValueError(
+                    "embedding dataset has no 'embedding' column and automatic detection "
+                    f"found {candidates}; pass --embedding_column explicitly"
+                )
+            embedding_column = candidates[0]
+            print(f"Using detected embedding column {embedding_column!r}.")
+    elif embedding_column not in dataset.column_names:
+        raise ValueError(
+            f"requested embedding column {embedding_column!r} is absent; available "
+            f"columns: {dataset.column_names}"
+        )
+    dataset.set_format("numpy", columns=["unique_id", embedding_column])
+    values = dataset[:]
+    ids = np.asarray(values["unique_id"])
+    embeddings = np.asarray(values[embedding_column])
+    normalized_ids = [_python_scalar(value) for value in ids]
+    if len(set(normalized_ids)) != len(normalized_ids):
+        raise ValueError("embedding dataset contains duplicate unique_id values")
+
+    available_ids = set(normalized_ids)
+    if eligible_ids is not None:
+        missing_eligible = eligible_ids - available_ids
+        if missing_eligible:
+            preview = list(missing_eligible)[:10]
+            raise ValueError(
+                f"embedding dataset is missing {len(missing_eligible)} IDs required by "
+                f"--eligible_ids_path; first IDs: {preview}"
+            )
+
+    keep = np.asarray(
+        [
+            uid in test_ids and (eligible_ids is None or uid in eligible_ids)
+            for uid in normalized_ids
+        ],
+        dtype=bool,
     )
-    return recall
+    if not keep.any():
+        raise ValueError("no embedding IDs remain after test/eligible-ID filtering")
+    dropped = len(keep) - int(keep.sum())
+    if dropped:
+        print(f"Filtered out {dropped:,} embeddings outside the evaluation population.")
+    return ids[keep], np.ascontiguousarray(embeddings[keep], dtype=np.float32)
 
 
-def process_finished_batch(sim_scores_gpu, batch_info, all_ids, idx_to_gt_key_map, gt_lookup, metrics_results, similarity_matrix_mmap, K_VALUES, num_rows, device, student_eval):
-    """
-    This function contains all the processing logic for a batch whose GPU computation is complete.
-    """
-    batch_start, batch_end, batch_size = batch_info
+def _load_group_keys(
+    data_dir: str,
+    ids: np.ndarray,
+    *,
+    metadata_num_proc: int,
+) -> list[tuple[str, str, str]]:
+    metadata_path = os.path.join(data_dir, "assembly_x64_1024_clap")
+    metadata = load_from_disk(metadata_path)
+    missing = {"unique_id", *IDENTITY_COLUMNS} - set(metadata.column_names)
+    if missing:
+        raise ValueError(f"metadata dataset is missing columns: {sorted(missing)}")
 
-    # --- 1. METRICS CALCULATION (GPU-accelerated) ---
-    # Build y_true batch on CPU (this is fast)
-    y_true_batch_cpu = np.zeros((batch_size, num_rows), dtype=np.float32)
-    for j in range(batch_size):
-        anchor_idx = batch_start + j
-        anchor_key = idx_to_gt_key_map.get(anchor_idx)
-        if anchor_key and anchor_key in gt_lookup:
-            y_true_batch_cpu[j, gt_lookup[anchor_key]] = 1
-    
-    # Move to GPU and calculate all metrics
-    y_true_batch_gpu = torch.from_numpy(y_true_batch_cpu).to(device)
-    
-    predicted_order = torch.argsort(sim_scores_gpu, dim=1, descending=True)
-    ranked_relevance = torch.gather(y_true_batch_gpu, 1, predicted_order)
-    
-    metrics_results['mrr'].extend(mrr_batch(ranked_relevance).cpu().tolist())
-    for k in K_VALUES:
-        metrics_results[f'precision@{k}'].extend(precision_at_k_batch(ranked_relevance, k).cpu().tolist())
-        metrics_results[f'ndcg@{k}'].extend(ndcg_at_k_batch(y_true_batch_gpu, sim_scores_gpu, k).cpu().tolist())
-        metrics_results[f'recall@{k}'].extend(recall_at_k_batch(ranked_relevance, k).cpu().tolist())
+    wanted = {_python_scalar(value) for value in ids}
+    metadata = metadata.filter(
+        lambda batch: [_python_scalar(uid) in wanted for uid in batch["unique_id"]],
+        batched=True,
+        num_proc=None if metadata_num_proc == 1 else metadata_num_proc,
+        desc="Selecting evaluation metadata",
+    )
+    metadata.set_format("numpy", columns=["unique_id", *IDENTITY_COLUMNS])
+    values = metadata[:]
 
-    # --- 2. SAVE TO DISK (CPU-side) ---
-    mask = torch.ones_like(sim_scores_gpu, dtype=bool)
-    row_indices = torch.arange(batch_size)
-    col_indices = batch_start + row_indices
-    mask[row_indices, col_indices] = False
-    processed_batch = sim_scores_gpu[mask].view(current_batch_size, num_rows - 1)
+    by_id: dict[Any, tuple[str, str, str]] = {}
+    for row in range(len(metadata)):
+        uid = _python_scalar(values["unique_id"][row])
+        if uid in by_id:
+            raise ValueError(f"metadata contains duplicate unique_id {uid!r}")
+        by_id[uid] = tuple(str(values[column][row]) for column in IDENTITY_COLUMNS)
 
-    if not student_eval:
-        similarity_matrix_mmap[batch_start:batch_end, :] = processed_batch.cpu().numpy()
+    missing_ids = [
+        _python_scalar(uid) for uid in ids if _python_scalar(uid) not in by_id
+    ]
+    if missing_ids:
+        raise ValueError(
+            f"metadata is missing {len(missing_ids)} embedding IDs; first IDs: {missing_ids[:10]}"
+        )
+    return [by_id[_python_scalar(uid)] for uid in ids]
 
-    return processed_batch
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate a similarity matrix and save to np.memmap.")
+def _select_benchmark_queries(
+    group_keys: list[tuple[str, str, str]], count: int, seed: int
+) -> np.ndarray:
+    frequencies = Counter(group_keys)
+    eligible = np.asarray(
+        [index for index, key in enumerate(group_keys) if frequencies[key] > 1],
+        dtype=np.int64,
+    )
+    if count > len(eligible):
+        raise ValueError(
+            f"requested {count} benchmark queries, but only {len(eligible)} are eligible"
+        )
+    rng = np.random.default_rng(seed)
+    return np.sort(rng.choice(eligible, size=count, replace=False))
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compute exact MRR, Recall@k, and nDCG@k over the full non-self "
+            "candidate corpus without materializing or sorting the full score matrix."
+        )
+    )
     parser.add_argument("--data_dir", required=True)
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--split", default='project')
-    parser.add_argument("--method", required=True, help="Method name for the model (e.g., 'teacher_model')")
-    parser.add_argument("--batch_size", default=1024, type=int, help="Batch size for GPU queries. Tune based on VRAM.")
-    parser.add_argument("--model_name", default='clap', help="Model name for student-teacher evaluation.")
-    parser.add_argument("--embeddings_dataset_path", type=str, required=True, help="Path to the pre-computed embeddings dataset.")
-    parser.add_argument("--skip_teacher", action="store_true", help="Skip loading teacher embeddings and skip teacher comparison metrics.")
-    args = parser.parse_args()
-
-    # The method and init_suffix are now only for naming the output report
-    method_name_with_suffix = args.method
-
-    print(f'compute metrics with {method_name_with_suffix} on split {args.split}')
-    IS_STUDENT_EVAL = args.method not in ['clap', 'deepseek', 'starcoder2', 'qwen' ,'llm4decompile', 'nova']
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f'device {device}')
-    K_VALUES = [1, 5, 10, 50, 100, 512, 1024]
-
-    source_dataset_path = args.embeddings_dataset_path
-    print(f'Loading dataset from {source_dataset_path}')
-    source_dataset = load_from_disk(source_dataset_path)
-    source_dataset.set_format("numpy", columns=['unique_id', 'embedding'])
-
-    with open(os.path.join(args.data_dir, f"cross_{args.split}_split.json")) as f:
-        indices = json.load(f)
-
-    test_ids = set(indices["test"])
-
-    # source_dataset = load_from_disk(os.path.join(args.data_dir, f'assembly_x64_1024_{args.method}'))
-    # source_dataset = source_dataset.rename_column(f'{args.method}_embedding', 'embedding')
-    # source_dataset = source_dataset.filter(lambda batch: [uid in test_ids for uid in batch["unique_id"]], batched=True, num_proc=16)
-    # source_dataset.set_format("numpy", columns=['unique_id', 'embedding'])
-
-    # load into ram
-    all_data_np = source_dataset[:] 
-    all_ids = all_data_np['unique_id']
-
-    all_embeddings_np = np.ascontiguousarray(all_data_np['embedding'], dtype=np.float32)
-    num_rows, dim = all_embeddings_np.shape
-    print(f"Loaded {num_rows} embeddings of dimension {dim}.")
-    test_ids_set = set(all_ids)
-
-    if IS_STUDENT_EVAL and not args.skip_teacher:
-        print(f"Loading pre-computed teacher scores for {args.model_name}")
-        teacher_matrix_path = os.path.join(args.output_dir, 'inference/cosine_scores', args.split, f"{args.model_name}_similarity_matrix.mmap")
-        teacher_ids_path = os.path.join(args.output_dir, 'inference/cosine_scores', args.split, f"{args.model_name}_ids.npy")
-
-        teacher_ids = np.load(teacher_ids_path, allow_pickle=True)
-        assert np.array_equal(all_ids, teacher_ids), "Mismatch between student and teacher IDs!"
-        
-        teacher_similarity_mmap = np.memmap(teacher_matrix_path, dtype='float32', mode='r', shape=(num_rows, num_rows - 1)) 
-
-    # load grount truth dataset
-    metadata_full_dataset = load_from_disk(os.path.join(args.data_dir, 'assembly_x64_1024_clap'))
-    metadata_dataset = metadata_full_dataset.filter(
-        lambda x: x['unique_id'] in test_ids_set,
-        num_proc=16 # Use multiple processes for faster filtering
+    parser.add_argument("--split", default="project")
+    parser.add_argument("--method", required=True, help="Model/run label used in the report")
+    parser.add_argument("--model_name", default="clap", help="Teacher/report grouping label")
+    parser.add_argument("--embeddings_dataset_path", required=True)
+    parser.add_argument(
+        "--embedding_column",
+        help=(
+            "Embedding column name. Defaults to 'embedding', or the sole column "
+            "ending in '_embedding'."
+        ),
     )
-    metadata_dataset.set_format(columns=['unique_id', 'binary_name', 'function_name'])
-
-    # create mapping
-    id_to_idx_map = {uid: i for i, uid in enumerate(all_ids)}
-    
-    #  GT map (key -> list of indices)
-    idx_to_gt_key_map = {}
-    for row in metadata_dataset:
-        uid = row['unique_id']
-        if uid in id_to_idx_map:
-            idx = id_to_idx_map[uid]
-            idx_to_gt_key_map[idx] = (row['binary_name'], row['function_name'])
-
-    # GT lookup map (key -> list of indices)
-    gt_lookup = {}
-    for idx, key in idx_to_gt_key_map.items():
-        if key not in gt_lookup:
-            gt_lookup[key] = []
-        gt_lookup[key].append(idx)
-
-    # output path
-    output_path_matrix = os.path.join(args.output_dir, 'inference/cosine_scores',  args.split, f"{method_name_with_suffix}_similarity_matrix.mmap")
-    output_path_ids = os.path.join(args.output_dir, 'inference/cosine_scores',  args.split, f"{method_name_with_suffix}_ids.npy")
-    os.makedirs(os.path.dirname(output_path_matrix), exist_ok=True)
-
-    # allocate space
-    if not IS_STUDENT_EVAL:
-        print(f"Running in TEACHER mode. Scores will be saved to disk.")
-        output_path_matrix = os.path.join(args.output_dir, 'inference/cosine_scores',  args.split, f"{method_name_with_suffix}_similarity_matrix.mmap")
-        output_path_ids = os.path.join(args.output_dir, 'inference/cosine_scores',  args.split, f"{method_name_with_suffix}_ids.npy")
-        os.makedirs(os.path.dirname(output_path_matrix), exist_ok=True)
-        similarity_matrix_mmap = np.memmap(output_path_matrix, dtype='float32', mode='w+', shape=(num_rows, num_rows - 1))    
-        np.save(output_path_ids, all_ids)
-    else:
-        print(f"Running in STUDENT mode. Scores will NOT be saved to disk.")
-        similarity_matrix_mmap = None
-
-    # setup torch 
-    all_embeddings_gpu = torch.from_numpy(all_embeddings_np).to(device)
-    all_embeddings_T_gpu = all_embeddings_gpu.T
-
-
-    # dict for metrics
-    metrics_results = {'mrr': []}
-    if IS_STUDENT_EVAL:
-        metrics_results['spearman'] = []
-
-    for k in K_VALUES:
-        metrics_results[f'ndcg@{k}'] = []
-        metrics_results[f'precision@{k}'] = []
-        metrics_results[f'recall@{k}'] = []
-
-    start_time = time.time()
-    prev_sim_scores_gpu = None
-    prev_batch_info = None
-
-    for i in tqdm(range(0, num_rows, args.batch_size), desc="Writing Similarity Batches"):
-        batch_start, batch_end = i, min(i + args.batch_size, num_rows)
-        current_batch_size = batch_end - batch_start
-
-        query_batch_gpu = all_embeddings_gpu[batch_start:batch_end]
-        sim_scores_gpu = torch.matmul(query_batch_gpu, all_embeddings_T_gpu)
-
-        # ranked base metrics
-        y_true_batch_cpu = np.zeros((current_batch_size, num_rows), dtype=np.float32)
-        for j in range(current_batch_size):
-            anchor_idx = batch_start + j
-            anchor_key = idx_to_gt_key_map.get(anchor_idx)
-            if anchor_key and anchor_key in gt_lookup:
-                y_true_batch_cpu[j, gt_lookup[anchor_key]] = 1
-        
-        y_true_batch_gpu = torch.from_numpy(y_true_batch_cpu).to(device)
-        predicted_order = torch.argsort(sim_scores_gpu, dim=1, descending=True)
-        ranked_relevance = torch.gather(y_true_batch_gpu, 1, predicted_order)
-        
-        metrics_results['mrr'].extend(mrr_batch(ranked_relevance).cpu().tolist())
-        for k in K_VALUES:
-            metrics_results[f'precision@{k}'].extend(precision_at_k_batch(ranked_relevance, k).cpu().tolist())
-            metrics_results[f'ndcg@{k}'].extend(ndcg_at_k_batch(y_true_batch_gpu, sim_scores_gpu, k).cpu().tolist())
-            metrics_results[f'recall@{k}'].extend(recall_at_k_batch(ranked_relevance, k).cpu().tolist())
-
-        # distillation metrics
-        mask = torch.ones_like(sim_scores_gpu, dtype=torch.bool)
-        row_indices = torch.arange(current_batch_size, device=device)
-        col_indices = batch_start + row_indices
-        mask[row_indices, col_indices] = False
-        sim_scores_processed_gpu = sim_scores_gpu[mask].view(current_batch_size, num_rows - 1)
-
-        if IS_STUDENT_EVAL:
-            if not args.skip_teacher:
-                # load teacher scores
-                sim_scores_teacher_cpu = teacher_similarity_mmap[batch_start:batch_end, :].copy() 
-                sim_scores_teacher_gpu = torch.from_numpy(sim_scores_teacher_cpu).to(device)
-                
-                # spearman
-                spearman_scores = spearman_corr_batch(sim_scores_processed_gpu, sim_scores_teacher_gpu)
-                metrics_results['spearman'].extend(spearman_scores.cpu().tolist())
-        else: 
-            # save to disk
-            similarity_matrix_mmap[batch_start:batch_end, :] = sim_scores_processed_gpu.cpu().numpy()
-        
+    parser.add_argument(
+        "--batch_size",
+        "--query_batch_size",
+        dest="query_batch_size",
+        default=128,
+        type=int,
+        help="Queries processed together; lower this if memory is insufficient",
+    )
+    parser.add_argument(
+        "--candidate_block_size",
+        default=32768,
+        type=int,
+        help="Corpus embeddings scored per block",
+    )
+    parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
+    parser.add_argument(
+        "--num_threads",
+        type=int,
+        default=None,
+        help="PyTorch CPU worker threads; defaults to the environment configuration",
+    )
+    parser.add_argument(
+        "--k_values",
+        nargs="+",
+        type=int,
+        default=[1, 512, 1024],
+        help="Recall and nDCG cutoffs",
+    )
+    parser.add_argument(
+        "--eligible_ids_path",
+        help=(
+            "Optional .npy file or Hugging Face embedding dataset defining an exact "
+            "common evaluation population across models"
+        ),
+    )
+    parser.add_argument(
+        "--benchmark_queries",
+        type=int,
+        help="Evaluate a seeded subset and project full-population runtime",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--metadata_num_proc", type=int, default=16)
+    parser.add_argument("--report_path", help="Override the default JSON report path")
+    parser.add_argument(
+        "--no_progress",
+        action="store_true",
+        help="Disable the query-batch progress bar",
+    )
+    parser.add_argument(
+        "--skip_teacher",
+        action="store_true",
+        help="Deprecated compatibility flag; teacher scores are no longer loaded",
+    )
+    parser.add_argument("--limit", type=int, help="Deprecated alias for --benchmark_queries")
+    args = parser.parse_args()
+    if args.limit is not None:
+        if args.benchmark_queries is not None:
+            parser.error("use only one of --limit and --benchmark_queries")
+        args.benchmark_queries = args.limit
+    return args
 
 
+def main() -> None:
+    args = parse_args()
+    if args.metadata_num_proc <= 0:
+        raise ValueError("--metadata_num_proc must be positive")
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--device cuda was requested, but CUDA is unavailable")
+    selected_device = "cuda" if args.device == "auto" and torch.cuda.is_available() else args.device
+    if selected_device == "auto":
+        selected_device = "cpu"
+    print(f"Evaluating {args.method!r} on {selected_device} with split {args.split!r}.")
 
-    # flush changes to disk to ensure everything is saved
-    if not IS_STUDENT_EVAL:
-        similarity_matrix_mmap.flush()
+    split_path = os.path.join(args.data_dir, f"cross_{args.split}_split.json")
+    with open(split_path, encoding="utf-8") as stream:
+        split_definition = json.load(stream)
+    if "test" not in split_definition:
+        raise ValueError(f"{split_path} has no 'test' split")
+    test_ids = {_python_scalar(value) for value in split_definition["test"]}
+    eligible_ids = _load_eligible_ids(args.eligible_ids_path)
+    ids, embeddings = _load_embeddings(
+        args.embeddings_dataset_path,
+        test_ids,
+        eligible_ids,
+        args.embedding_column,
+    )
+    group_keys = _load_group_keys(
+        args.data_dir, ids, metadata_num_proc=args.metadata_num_proc
+    )
+    print(f"Loaded {len(ids):,} embeddings with dimension {embeddings.shape[1]:,}.")
 
-    end_time = time.time()
-    print(f"\nMatrix generation complete. Took {(end_time - start_time) / 60:.2f} minutes.")
-    
-    if metrics_results['mrr']:
-        final_report = {"model_name": method_name_with_suffix}
-        print("\n--- Teacher Performance Metrics ---")
-        final_report['mrr'] = np.mean(metrics_results['mrr'])
-        print(f"Teacher MRR: {final_report['mrr']:.4f}")
+    query_indices = None
+    if args.benchmark_queries is not None:
+        if args.benchmark_queries <= 0:
+            raise ValueError("--benchmark_queries must be positive")
+        query_indices = _select_benchmark_queries(group_keys, args.benchmark_queries, args.seed)
+        print(f"Benchmarking {len(query_indices):,} seeded eligible queries.")
 
-        if IS_STUDENT_EVAL and not args.skip_teacher:
-            final_report['spearman'] = np.mean(metrics_results['spearman'])
-            print(f"Teacher spearman: {final_report['spearman']:.4f}")
+    evaluation = evaluate_embeddings(
+        embeddings,
+        group_keys,
+        k_values=args.k_values,
+        query_indices=query_indices,
+        query_batch_size=args.query_batch_size,
+        candidate_block_size=args.candidate_block_size,
+        device=args.device,
+        num_threads=args.num_threads,
+        progress=not args.no_progress,
+    )
+    projected_seconds = (
+        evaluation.elapsed_seconds
+        * evaluation.eligible_queries
+        / evaluation.evaluated_queries
+    )
 
-        for k in K_VALUES:
-            final_report[f'ndcg@{k}'] = np.mean(metrics_results[f'ndcg@{k}'])
-            final_report[f'precision@{k}'] = np.mean(metrics_results[f'precision@{k}'])
-            final_report[f'recall@{k}'] = np.mean(metrics_results[f'recall@{k}']) # <-- ADD THIS LINE
-            print(f"Teacher NDCG@{k}: {final_report[f'ndcg@{k}']:.4f}")
-            print(f"Teacher Precision@{k}: {final_report[f'precision@{k}']:.4f}")
-            print(f"Teacher Recall@{k}: {final_report[f'recall@{k}']:.4f}")
+    report = {
+        "model_name": args.method,
+        "protocol": {
+            "similarity": "cosine (explicit L2 normalization)",
+            "self_match": "excluded before ranking and relevance counting",
+            "ground_truth_key": list(IDENTITY_COLUMNS),
+            "query_policy": "queries with at least one non-self positive",
+            "mrr": "mean reciprocal rank of first relevant candidate",
+            "relevance": "binary",
+            "tie_policy": evaluation.tie_policy,
+            "k_values": sorted(set(args.k_values)),
+            "seed": args.seed,
+            "eligible_ids_path": args.eligible_ids_path,
+            "embedding_column": args.embedding_column or "auto",
+        },
+        "population": {
+            key: value
+            for key, value in asdict(evaluation).items()
+            if key not in {"metrics", "tie_policy"}
+        },
+        "metrics": evaluation.metrics,
+        "projected_full_runtime_seconds": projected_seconds,
+    }
+    report.update(evaluation.metrics)
 
-        report_path = os.path.join(args.output_dir, 'inference/metrics', args.split, args.model_name, f"{method_name_with_suffix}_metrics_report.json")
-        os.makedirs(os.path.dirname(report_path), exist_ok=True)
-        with open(report_path, 'w') as f:
-            json.dump(final_report, f, indent=4)
-        print(f"\nTeacher metrics report saved to: {report_path}")
+    print("\n--- Corrected Retrieval Metrics ---")
+    for name, value in evaluation.metrics.items():
+        print(f"{name}: {value:.6f}")
+    print(
+        f"Evaluated {evaluation.evaluated_queries:,}/{evaluation.eligible_queries:,} "
+        f"eligible queries in {evaluation.elapsed_seconds / 60:.2f} minutes."
+    )
+    if evaluation.evaluated_queries < evaluation.eligible_queries:
+        print(f"Projected full runtime: {projected_seconds / 3600:.2f} hours.")
+
+    report_path = args.report_path
+    if report_path is None:
+        report_path = os.path.join(
+            args.output_dir,
+            "inference",
+            "metrics",
+            args.split,
+            args.model_name,
+            f"{args.method}_corrected_metrics_report.json",
+        )
+    Path(report_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(report_path, "w", encoding="utf-8") as stream:
+        json.dump(report, stream, indent=2)
+    print(f"Report saved to {report_path}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
