@@ -1,4 +1,4 @@
-<h1 style="text-align:center;">Binary Analysis with AI SoSe 2025 </h1>
+<h1 style="text-align:center;">Knowledge Distillation </h1>
 
 <h4 align="center">
 <p>
