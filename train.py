@@ -28,7 +28,6 @@ model_dims = {
     "deepseek":   4096,
     "qwen":       3584,
     "nova":      2048,
-    "codellama":  "/home/wang/Data/llms/CodeLlama-7b-hf",
 }
 
 class JointDataCollator:
