@@ -255,7 +255,7 @@ class JointTrainer(Trainer):
                     
                 proxy_params = [p for p in proxy_params if p.requires_grad]
                 
-                def get_normalized_proxy_grad(loss_val):
+                def get_proxy_grad(loss_val):
                     grads = torch.autograd.grad(
                         outputs=loss_val, 
                         inputs=proxy_params, 
@@ -275,12 +275,12 @@ class JointTrainer(Trainer):
                         return torch.zeros_like(combined_grad), norm
                     return combined_grad, norm
 
-                grad_main, norm_main = get_normalized_proxy_grad(L_main)
+                grad_main, norm_main = get_proxy_grad(L_main)
                 norm_main_val = norm_main.item() if isinstance(norm_main, torch.Tensor) else norm_main
                 
                 if grad_main is not None:
                     if isinstance(L_mlm, torch.Tensor) and L_mlm.requires_grad:
-                        grad_mlm, norm_mlm = get_normalized_proxy_grad(L_mlm)
+                        grad_mlm, norm_mlm = get_proxy_grad(L_mlm)
                         norm_mlm_val = norm_mlm.item() if isinstance(norm_mlm, torch.Tensor) else norm_mlm
                         if grad_mlm is not None:
                             sampled_dot_mlm = torch.nan_to_num(torch.dot(grad_main, grad_mlm)).item()
@@ -288,7 +288,7 @@ class JointTrainer(Trainer):
                                 self.scale_mlm = torch.clamp(norm_main / norm_mlm, min=0.001, max=1000.0).item()
                     
                     if isinstance(L_distill, torch.Tensor) and L_distill.requires_grad:
-                        grad_distill, norm_distill = get_normalized_proxy_grad(L_distill)
+                        grad_distill, norm_distill = get_proxy_grad(L_distill)
                         norm_distill_val = norm_distill.item() if isinstance(norm_distill, torch.Tensor) else norm_distill
                         if grad_distill is not None:
                             sampled_dot_distill = torch.nan_to_num(torch.dot(grad_main, grad_distill)).item()
@@ -342,8 +342,14 @@ class JointTrainer(Trainer):
             
         if self.model.training and (self.use_ol_aux or self.analyze_gradients):
             if nce_active and (self.ol_aux_strict_paper or (self.step_counter % self.ol_aux_horizon == 0)):
-                outputs["cos_sim_mlm"] = torch.tensor(sampled_dot_mlm, device=total_loss.device)
-                outputs["cos_sim_distill"] = torch.tensor(sampled_dot_distill, device=total_loss.device)
+                mlm_denominator = norm_main_val * norm_mlm_val
+                distill_denominator = norm_main_val * norm_distill_val
+                cos_sim_mlm = sampled_dot_mlm / mlm_denominator if mlm_denominator > 0 else 0.0
+                cos_sim_distill = sampled_dot_distill / distill_denominator if distill_denominator > 0 else 0.0
+                outputs["grad_dot_product_mlm"] = torch.tensor(sampled_dot_mlm, device=total_loss.device)
+                outputs["grad_dot_product_distill"] = torch.tensor(sampled_dot_distill, device=total_loss.device)
+                outputs["cos_sim_mlm"] = torch.tensor(cos_sim_mlm, device=total_loss.device)
+                outputs["cos_sim_distill"] = torch.tensor(cos_sim_distill, device=total_loss.device)
                 outputs["grad_norm_main"] = torch.tensor(norm_main_val, device=total_loss.device)
                 outputs["grad_norm_mlm"] = torch.tensor(norm_mlm_val, device=total_loss.device)
                 outputs["grad_norm_distill"] = torch.tensor(norm_distill_val, device=total_loss.device)
@@ -353,7 +359,7 @@ class JointTrainer(Trainer):
 
         # Logging happens AFTER outputs are correctly populated
         if self.model.training:
-            logs = {f"train/{k}": v.item() for k, v in outputs.items() if "loss" in k or "w_" in k or "scale_" in k or "cos_sim_" in k or "grad_norm_" in k or k in ("temperature", "nce_active")}
+            logs = {f"train/{k}": v.item() for k, v in outputs.items() if "loss" in k or "w_" in k or "scale_" in k or "cos_sim_" in k or "grad_norm_" in k or "grad_dot_product_" in k or k in ("temperature", "nce_active")}
             self.log(logs)
         else:
             logs = {f"eval/{k}": v.item() for k, v in outputs.items() if "loss" in k}

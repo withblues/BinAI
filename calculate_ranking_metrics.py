@@ -110,12 +110,11 @@ def _load_embeddings(
 
 
 def _load_group_keys(
-    data_dir: str,
+    metadata_path: str,
     ids: np.ndarray,
     *,
     metadata_num_proc: int,
-) -> list[tuple[str, str, str]]:
-    metadata_path = os.path.join(data_dir, "assembly_x64_1024_clap")
+) -> list[tuple[str, str]]:
     metadata = load_from_disk(metadata_path)
     missing = {"unique_id", *IDENTITY_COLUMNS} - set(metadata.column_names)
     if missing:
@@ -131,7 +130,7 @@ def _load_group_keys(
     metadata.set_format("numpy", columns=["unique_id", *IDENTITY_COLUMNS])
     values = metadata[:]
 
-    by_id: dict[Any, tuple[str, str, str]] = {}
+    by_id: dict[Any, tuple[str, str]] = {}
     for row in range(len(metadata)):
         uid = _python_scalar(values["unique_id"][row])
         if uid in by_id:
@@ -149,7 +148,7 @@ def _load_group_keys(
 
 
 def _select_benchmark_queries(
-    group_keys: list[tuple[str, str, str]], count: int, seed: int
+    group_keys: list[tuple[str, str]], count: int, seed: int
 ) -> np.ndarray:
     frequencies = Counter(group_keys)
     eligible = np.asarray(
@@ -173,6 +172,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--data_dir", required=True)
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument(
+        "--test_dataset_path",
+        help=(
+            "Optional pre-filtered test dataset containing unique_id and metadata. "
+            "When omitted, use the full dataset and configured split file."
+        ),
+    )
     parser.add_argument("--split", default="project")
     parser.add_argument("--method", required=True, help="Model/run label used in the report")
     parser.add_argument("--model_name", default="clap", help="Teacher/report grouping label")
@@ -257,12 +263,22 @@ def main() -> None:
         selected_device = "cpu"
     print(f"Evaluating {args.method!r} on {selected_device} with split {args.split!r}.")
 
-    split_path = os.path.join(args.data_dir, f"cross_{args.split}_split.json")
-    with open(split_path, encoding="utf-8") as stream:
-        split_definition = json.load(stream)
-    if "test" not in split_definition:
-        raise ValueError(f"{split_path} has no 'test' split")
-    test_ids = {_python_scalar(value) for value in split_definition["test"]}
+    if args.test_dataset_path:
+        metadata_path = args.test_dataset_path
+        test_dataset = load_from_disk(metadata_path)
+        if "unique_id" not in test_dataset.column_names:
+            raise ValueError(
+                f"test dataset {metadata_path!r} does not contain unique_id"
+            )
+        test_ids = {_python_scalar(value) for value in test_dataset["unique_id"]}
+    else:
+        metadata_path = os.path.join(args.data_dir, "assembly_x64_1024_clap")
+        split_path = os.path.join(args.data_dir, f"cross_{args.split}_split.json")
+        with open(split_path, encoding="utf-8") as stream:
+            split_definition = json.load(stream)
+        if "test" not in split_definition:
+            raise ValueError(f"{split_path} has no 'test' split")
+        test_ids = {_python_scalar(value) for value in split_definition["test"]}
     eligible_ids = _load_eligible_ids(args.eligible_ids_path)
     ids, embeddings = _load_embeddings(
         args.embeddings_dataset_path,
@@ -271,7 +287,9 @@ def main() -> None:
         args.embedding_column,
     )
     group_keys = _load_group_keys(
-        args.data_dir, ids, metadata_num_proc=args.metadata_num_proc
+        metadata_path,
+        ids,
+        metadata_num_proc=args.metadata_num_proc,
     )
     print(f"Loaded {len(ids):,} embeddings with dimension {embeddings.shape[1]:,}.")
 
@@ -311,7 +329,12 @@ def main() -> None:
             "tie_policy": evaluation.tie_policy,
             "k_values": sorted(set(args.k_values)),
             "seed": args.seed,
-            "eligible_ids_path": args.eligible_ids_path,
+            "eligible_ids_filter": args.eligible_ids_path is not None,
+            "test_population_source": (
+                "explicit prefiltered test dataset"
+                if args.test_dataset_path
+                else f"cross_{args.split}_split.json"
+            ),
             "embedding_column": args.embedding_column or "auto",
         },
         "population": {
