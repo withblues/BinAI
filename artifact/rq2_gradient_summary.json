@@ -1,0 +1,29 @@
+{
+  "rows": 2799,
+  "first_global_step": 9,
+  "last_global_step": 27989,
+  "note": "The historical W&B field cos_sim_distill stored the raw gradient dot product. corrected_cosine_similarity divides it by both exported gradient norms.",
+  "objectives": {
+    "joint_sim_CLAP": {
+      "mean_corrected_cosine_similarity": -0.04028777154665575,
+      "mean_norm_ratio": 0.08339555669125322,
+      "mean_raw_dot_product": 0.0032203854460776974,
+      "minimum_corrected_cosine_similarity": -0.27817159242847705,
+      "maximum_corrected_cosine_similarity": 0.5802839018432556
+    },
+    "joint_rank_CLAP": {
+      "mean_corrected_cosine_similarity": -0.12260891326040109,
+      "mean_norm_ratio": 1.9823196443857465,
+      "mean_raw_dot_product": -0.13723606616524806,
+      "minimum_corrected_cosine_similarity": -0.5271945743320585,
+      "maximum_corrected_cosine_similarity": 0.3277530319840564
+    },
+    "joint_embd_CLAP": {
+      "mean_corrected_cosine_similarity": -0.25142950524549235,
+      "mean_norm_ratio": 0.47195309736071595,
+      "mean_raw_dot_product": -0.03899803010097335,
+      "minimum_corrected_cosine_similarity": -0.5983042159539579,
+      "maximum_corrected_cosine_similarity": 0.08247215157345737
+    }
+  }
+}

@@ -1,0 +1,83 @@
+kind	group	required	source	destination	paper_use
+file	code	yes	LICENSE	LICENSE	Repository license
+file	code	yes	README.md	README.md	Artifact overview and reproduction instructions
+file	environment	yes	environment.yml	environment.yml	Conda environment used for the experiments
+file	environment	yes	requirements-lock.txt	requirements-lock.txt	Complete package snapshot
+file	code	yes	collect_asm.py	code/collect_asm.py	Dataset extraction
+file	code	yes	create_split.py	code/create_split.py	Cross-project and cross-binary splits
+file	code	yes	process_asm.py	code/process_asm.py	IDA-side disassembly processing
+file	code	yes	train_tokenizer.py	code/train_tokenizer.py	Student tokenizer training
+file	code	yes	pretrain_bert.py	code/pretrain_bert.py	MLM pretraining
+file	code	yes	precompute.py	code/precompute.py	Teacher representation generation
+file	code	yes	similarity_random_ft_precompute.py	code/similarity_random_ft_precompute.py	Deterministic InfoNCE anchor positive and negative index generation
+file	code	yes	train.py	code/train.py	Student training and gradient analysis
+file	code	yes	inference_embeddings.py	code/inference_embeddings.py	Embedding generation and efficiency measurement
+file	code	yes	calculate_ranking_metrics.py	code/calculate_ranking_metrics.py	Corrected full-corpus retrieval evaluation
+directory	code	yes	src	code/src	Reusable models and utilities
+file	code	yes	artifact/README.md	artifact/README.md	Artifact assembly and audit instructions
+file	code	yes	artifact/PAPER_TO_FILES.md	artifact/PAPER_TO_FILES.md	Human-readable mapping from saved names to paper labels
+file	code	yes	artifact/manifest.tsv	artifact/manifest.tsv	Core artifact file manifest
+file	code	yes	artifact/stage_artifact.py	artifact/stage_artifact.py	Manifest-driven staging and checksum generation
+file	efficiency	yes	artifact/rq4_efficiency.json	results/efficiency/rq4_efficiency.json	Five clean CLAP and five distil_embd_CLAP measurements used in Table 1
+file	gradient	yes	artifact/rq2_gradient_history.csv	results/gradients/rq2_gradient_history.csv	Corrected per-step histories for Figure 2 and Table 4
+file	gradient	yes	artifact/rq2_gradient_summary.json	results/gradients/rq2_gradient_summary.json	Corrected aggregate gradient statistics for Table 4
+file	code	yes	artifact/prepare_gradient_history.py	artifact/prepare_gradient_history.py	Reconstruct normalized cosine similarity from the W&B exports
+file	code	yes	artifact/plot_rq2_gradients.py	artifact/plot_rq2_gradients.py	Reproduce Figure 2 from the corrected gradient history
+file	gradient	yes	output/pdf/cos_sim_gradients.pdf	results/gradients/cos_sim_gradients.pdf	Corrected Figure 2
+directory	data	yes	outputs/tokenizer	data/tokenizer	WordPiece tokenizer used by every student
+file	data	yes	outputs/cross_project_split.json	data/splits/cross_project_split.json	Paper split definition
+file	data	no	outputs/cross_binary_split.json	data/splits/cross_binary_split.json	Additional split supported by the code
+directory	data	yes	outputs/cosine_random_ft/cross_project_split	data/training_pairs/cross_project_split	Exact seed-42 anchor positive and negative index used for paper training
+directory	model	yes	outputs/bert_mlm_project/best_model	models/student_mlm_initialization	MLM-only baseline and initialization for downstream variants
+file	model	yes	outputs/bert_project/clap/ft_in_batch_128_scratch/student.pth	models/clap/ft_in_batch_128_scratch/student.pth	Table 2 Student Baseline without MLM
+file	model	yes	outputs/bert_project/clap/ft_in_batch_128/student.pth	models/clap/ft_in_batch_128_seed42/student.pth	Tables 2 and 3 task-only baseline seed 42
+file	model	yes	outputs/bert_project/clap/ft_in_batch_128_bs128_no_proj_seed7/student.pth	models/clap/ft_in_batch_128_seed7/student.pth	Table 3 task-only baseline seed 7
+file	model	yes	outputs/bert_project/clap/ft_in_batch_128_bs128_no_proj_seed99/student.pth	models/clap/ft_in_batch_128_seed99/student.pth	Table 3 task-only baseline seed 99
+file	model	yes	outputs/bert_project/clap/cosine_in_batch_128/student.pth	models/clap/distil_sim_128/student.pth	Table 2 pure similarity-score distillation
+file	model	yes	outputs/bert_project/clap/distil_cosine_64/student.pth	models/clap/distil_embd_64/student.pth	Table 5 context-length ablation
+file	model	yes	outputs/bert_project/clap/distil_cosine_64/projector.pth	models/clap/distil_embd_64/projector.pth	Table 5 context-length ablation projection
+file	model	yes	outputs/bert_project/clap/distil_cosine/student.pth	models/clap/distil_embd_128/student.pth	Tables 2 and 5 embedding distillation at 128 tokens
+file	model	yes	outputs/bert_project/clap/distil_cosine/projector.pth	models/clap/distil_embd_128/projector.pth	Tables 2 and 5 embedding projection
+file	model	yes	outputs/bert_project/clap/distil_cosine_256/student.pth	models/clap/distil_embd_256/student.pth	Table 5 context-length ablation
+file	model	yes	outputs/bert_project/clap/distil_cosine_256/projector.pth	models/clap/distil_embd_256/projector.pth	Table 5 context-length ablation projection
+file	model	yes	outputs/bert_project/clap/distil_cosine_512/student.pth	models/clap/distil_embd_512/student.pth	Table 5 context-length ablation
+file	model	yes	outputs/bert_project/clap/distil_cosine_512/projector.pth	models/clap/distil_embd_512/projector.pth	Table 5 context-length ablation projection
+file	model	yes	outputs/bert_project/clap/distil_cosine_1024/student.pth	models/clap/distil_embd_1024/student.pth	Table 5 context-length ablation
+file	model	yes	outputs/bert_project/clap/distil_cosine_1024/projector.pth	models/clap/distil_embd_1024/projector.pth	Table 5 context-length ablation projection
+file	model	yes	outputs/bert_project/clap/joint_in_batch_128_m0.0_d1.0_n1.0_embedding_cosine/student.pth	models/clap/joint_embd_seed42/student.pth	Table 2 joint embedding alignment
+file	model	yes	outputs/bert_project/clap/joint_in_batch_128_m0.0_d1.0_n1.0_embedding_cosine/projector.pth	models/clap/joint_embd_seed42/projector.pth	Table 2 joint embedding projection
+file	model	yes	outputs/bert_project/clap/joint_in_batch_128_bs128_no_proj_m0.0_d1.0_n1.0_pairwiserank_retrieval_dt0.05_seed42/student.pth	models/clap/joint_rank_seed42/student.pth	Table 2 joint relative-ranking distillation
+file	model	yes	outputs/bert_project/clap/joint_in_batch_128_bs128_no_proj_m0.0_d1.0_n1.0_seed42/student.pth	models/clap/joint_sim_seed42/student.pth	Tables 2 and 3 joint similarity matching seed 42
+file	model	yes	outputs/bert_project/clap/joint_in_batch_128_bs128_no_proj_m0.0_d1.0_n1.0_seed7/student.pth	models/clap/joint_sim_seed7/student.pth	Table 3 joint similarity matching seed 7
+file	model	yes	outputs/bert_project/clap/joint_in_batch_128_bs128_no_proj_m0.0_d1.0_n1.0_seed99/student.pth	models/clap/joint_sim_seed99/student.pth	Table 3 joint similarity matching seed 99
+file	model	yes	outputs/bert_project/nova/joint_in_batch_128_bs128_no_proj_m0.0_d1.0_n1.0/student.pth	models/nova/joint_sim_seed42/student.pth	Table 3 Nova-supervised joint similarity seed 42
+file	model	yes	outputs/bert_project/nova/joint_in_batch_128_bs128_no_proj_m0.0_d1.0_n1.0_seed7/student.pth	models/nova/joint_sim_seed7/student.pth	Table 3 Nova-supervised joint similarity seed 7
+file	model	yes	outputs/bert_project/nova/joint_in_batch_128_bs128_no_proj_m0.0_d1.0_n1.0_seed99/student.pth	models/nova/joint_sim_seed99/student.pth	Table 3 Nova-supervised joint similarity seed 99
+file	model	yes	outputs/bert_project/clap/joint_in_batch_128_bs128_no_proj_m0.0_d1.0_n1.0_analyze_grads/student.pth	models/gradient_analysis/joint_sim/student.pth	Figure 2 and Table 4 similarity gradient run
+file	model	yes	outputs/bert_project/clap/joint_in_batch_128_bs128_no_proj_m0.0_d1.0_n1.0_pairwiserank_retrieval_dt0.05_analyze_grads/student.pth	models/gradient_analysis/joint_rank/student.pth	Figure 2 and Table 4 ranking gradient run
+file	model	yes	outputs/bert_project/clap/joint_in_batch_128_bs128_with_proj_m0.0_d1.0_n1.0_embedding_cosine_analyze_grads/student.pth	models/gradient_analysis/joint_embd/student.pth	Figure 2 and Table 4 embedding gradient run
+file	model	yes	outputs/bert_project/clap/joint_in_batch_128_bs128_with_proj_m0.0_d1.0_n1.0_embedding_cosine_analyze_grads/projector.pth	models/gradient_analysis/joint_embd/projector.pth	Figure 2 and Table 4 embedding projection
+file	metric	yes	outputs_recalculate/inference/metrics/project/clap/base_corrected_metrics_report.json	results/metrics/clap/base_corrected_metrics_report.json	Table 2 MLM-only baseline
+file	metric	yes	outputs_recalculate/inference/metrics/project/clap/clap_corrected_metrics_report.json	results/metrics/clap/clap_corrected_metrics_report.json	Tables 3 and 5 zero-shot CLAP
+file	metric	yes	outputs_recalculate/inference/metrics/project/nova/nova_corrected_metrics_report.json	results/metrics/nova/nova_corrected_metrics_report.json	Table 3 zero-shot Nova
+file	metric	yes	outputs_recalculate/inference/metrics/project/clap/ft_in_batch_128_scratch_corrected_metrics_report.json	results/metrics/clap/ft_in_batch_128_scratch_corrected_metrics_report.json	Table 2 task-only without MLM
+file	metric	yes	outputs_recalculate/inference/metrics/project/clap/ft_in_batch_corrected_metrics_report.json	results/metrics/clap/ft_in_batch_seed42_corrected_metrics_report.json	Tables 2 and 3 task-only seed 42
+file	metric	yes	outputs_recalculate/inference/metrics/project/clap/ft_in_batch_128_bs128_no_proj_seed7_corrected_metrics_report.json	results/metrics/clap/ft_in_batch_seed7_corrected_metrics_report.json	Table 3 task-only seed 7
+file	metric	yes	outputs_recalculate/inference/metrics/project/clap/ft_in_batch_128_bs128_no_proj_seed99_corrected_metrics_report.json	results/metrics/clap/ft_in_batch_seed99_corrected_metrics_report.json	Table 3 task-only seed 99
+file	metric	yes	outputs_recalculate/inference/metrics/project/clap/cosine_in_batch_corrected_metrics_report.json	results/metrics/clap/distil_sim_128_corrected_metrics_report.json	Table 2 pure similarity-score distillation
+file	metric	yes	outputs_recalculate/inference/metrics/project/clap/distil_cosine_64_corrected_metrics_report.json	results/metrics/clap/distil_embd_64_corrected_metrics_report.json	Table 5 context length 64
+file	metric	yes	outputs_recalculate/inference/metrics/project/clap/distil_cosine_corrected_metrics_report.json	results/metrics/clap/distil_embd_128_corrected_metrics_report.json	Tables 2 and 5 context length 128
+file	metric	yes	outputs_recalculate/inference/metrics/project/clap/distil_cosine_256_corrected_metrics_report.json	results/metrics/clap/distil_embd_256_corrected_metrics_report.json	Table 5 context length 256
+file	metric	yes	outputs_recalculate/inference/metrics/project/clap/distil_cosine_512_corrected_metrics_report.json	results/metrics/clap/distil_embd_512_corrected_metrics_report.json	Table 5 context length 512
+file	metric	yes	outputs_recalculate/inference/metrics/project/clap/distil_cosine_1024_corrected_metrics_report.json	results/metrics/clap/distil_embd_1024_corrected_metrics_report.json	Table 5 context length 1024
+file	metric	yes	outputs_recalculate/inference/metrics/project/clap/joint_in_batch_128_m0.0_d1.0_n1.0_embedding_cosine_corrected_metrics_report.json	results/metrics/clap/joint_embd_seed42_corrected_metrics_report.json	Table 2 joint embedding alignment
+file	metric	yes	outputs_recalculate/inference/metrics/project/clap/joint_in_batch_128_bs128_no_proj_m0.0_d1.0_n1.0_pairwiserank_retrieval_dt0.05_seed42_corrected_metrics_report.json	results/metrics/clap/joint_rank_seed42_corrected_metrics_report.json	Table 2 joint ranking
+file	metric	yes	outputs_recalculate/inference/metrics/project/clap/joint_in_batch_128_bs128_no_proj_m0.0_d1.0_n1.0_seed42_corrected_metrics_report.json	results/metrics/clap/joint_sim_seed42_corrected_metrics_report.json	Tables 2 and 3 joint similarity seed 42
+file	metric	yes	outputs_recalculate/inference/metrics/project/clap/joint_in_batch_128_bs128_no_proj_m0.0_d1.0_n1.0_seed7_corrected_metrics_report.json	results/metrics/clap/joint_sim_seed7_corrected_metrics_report.json	Table 3 joint similarity seed 7
+file	metric	yes	outputs_recalculate/inference/metrics/project/clap/joint_in_batch_128_bs128_no_proj_m0.0_d1.0_n1.0_seed99_corrected_metrics_report.json	results/metrics/clap/joint_sim_seed99_corrected_metrics_report.json	Table 3 joint similarity seed 99
+file	metric	yes	outputs_recalculate/inference/metrics/project/nova/joint_in_batch_128_bs128_no_proj_m0.0_d1.0_n1.0_corrected_metrics_report.json	results/metrics/nova/joint_sim_seed42_corrected_metrics_report.json	Table 3 Nova-supervised seed 42
+file	metric	yes	outputs_recalculate/inference/metrics/project/nova/joint_in_batch_128_bs128_no_proj_m0.0_d1.0_n1.0_seed7_corrected_metrics_report.json	results/metrics/nova/joint_sim_seed7_corrected_metrics_report.json	Table 3 Nova-supervised seed 7
+file	metric	yes	outputs_recalculate/inference/metrics/project/nova/joint_in_batch_128_bs128_no_proj_m0.0_d1.0_n1.0_seed99_corrected_metrics_report.json	results/metrics/nova/joint_sim_seed99_corrected_metrics_report.json	Table 3 Nova-supervised seed 99
+file	metric	yes	outputs_recalculate/inference/metrics/project/clap/joint_in_batch_128_bs128_no_proj_m0.0_d1.0_n1.0_analyze_grads_corrected_metrics_report.json	results/metrics/gradient_analysis/joint_sim_corrected_metrics_report.json	Table 4 similarity gradient run
+file	metric	yes	outputs_recalculate/inference/metrics/project/clap/joint_in_batch_128_bs128_no_proj_m0.0_d1.0_n1.0_pairwiserank_retrieval_dt0.05_analyze_grads_corrected_metrics_report.json	results/metrics/gradient_analysis/joint_rank_corrected_metrics_report.json	Table 4 ranking gradient run
+file	metric	yes	outputs_recalculate/inference/metrics/project/clap/joint_in_batch_128_bs128_with_proj_m0.0_d1.0_n1.0_embedding_cosine_analyze_grads_corrected_metrics_report.json	results/metrics/gradient_analysis/joint_embd_corrected_metrics_report.json	Table 4 embedding gradient run

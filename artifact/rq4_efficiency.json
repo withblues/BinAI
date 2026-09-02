@@ -1,0 +1,108 @@
+{
+  "protocol": {
+    "corpus_functions": 514071,
+    "gpu": "NVIDIA H100",
+    "batch_size": 64,
+    "repetitions_per_model": 5,
+    "standard_deviation": "population",
+    "timing_boundary": "Starts after model and dataset initialization; includes DataLoader batch preparation, model inference, and CPU accumulation; excludes model loading and Hugging Face dataset serialization."
+  },
+  "models": {
+    "clap": {
+      "summary": {
+        "runs": 5,
+        "mean_corpus_time_seconds": 4224.361655521393,
+        "population_std_corpus_time_seconds": 0.8700583685593556,
+        "mean_throughput_functions_per_second": 121.69200076271643,
+        "population_std_throughput_functions_per_second": 0.025062340863469975,
+        "maximum_peak_gpu_memory_mib": 15499.0
+      },
+      "runs": [
+        {
+          "time": 4223.911579847336,
+          "peak_memory": 15499.0,
+          "avg_memory": 15489.095633887442,
+          "peak_util": 100.0,
+          "avg_util": 99.46424994992438
+        },
+        {
+          "time": 4223.396703004837,
+          "peak_memory": 15499.0,
+          "avg_memory": 15488.192336107964,
+          "peak_util": 100.0,
+          "avg_util": 99.44663350243265
+        },
+        {
+          "time": 4225.480713129044,
+          "peak_memory": 15499.0,
+          "avg_memory": 15488.60083341409,
+          "peak_util": 100.0,
+          "avg_util": 99.47504603158683
+        },
+        {
+          "time": 4225.332810640335,
+          "peak_memory": 15499.0,
+          "avg_memory": 15488.93445475638,
+          "peak_util": 100.0,
+          "avg_util": 99.48651392110828
+        },
+        {
+          "time": 4223.686470985413,
+          "peak_memory": 15499.0,
+          "avg_memory": 15488.931952376342,
+          "peak_util": 100.0,
+          "avg_util": 99.47875326686139
+        }
+      ]
+    },
+    "compact_student": {
+      "paper_variant": "distil_embd_CLAP at 128 tokens",
+      "source_experiment": "distil_cosine",
+      "summary": {
+        "runs": 5,
+        "mean_corpus_time_seconds": 125.0628909111023,
+        "population_std_corpus_time_seconds": 1.1860158324309202,
+        "mean_throughput_functions_per_second": 4110.866338677081,
+        "population_std_throughput_functions_per_second": 38.64182246180568,
+        "maximum_peak_gpu_memory_mib": 1083.0
+      },
+      "runs": [
+        {
+          "time": 127.23963570594788,
+          "peak_memory": 1083.0,
+          "avg_memory": 1078.56052141527,
+          "peak_util": 90.0,
+          "avg_util": 80.43575418994412
+        },
+        {
+          "time": 124.76939630508423,
+          "peak_memory": 1083.0,
+          "avg_memory": 1078.6261343012704,
+          "peak_util": 90.0,
+          "avg_util": 81.91651542649741
+        },
+        {
+          "time": 124.24520754814148,
+          "peak_memory": 1083.0,
+          "avg_memory": 1078.6425992779784,
+          "peak_util": 90.0,
+          "avg_util": 82.62996389891714
+        },
+        {
+          "time": 123.83279538154602,
+          "peak_memory": 1083.0,
+          "avg_memory": 1078.6187050359713,
+          "peak_util": 90.0,
+          "avg_util": 82.2428057553959
+        },
+        {
+          "time": 125.22741961479187,
+          "peak_memory": 1083.0,
+          "avg_memory": 1078.8295081967212,
+          "peak_util": 90.0,
+          "avg_util": 83.59836065573779
+        }
+      ]
+    }
+  }
+}
